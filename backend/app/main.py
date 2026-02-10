@@ -1,7 +1,12 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.routes.clone import router as clone_router
 
-app = FastAPI(title="Backend API")
+app = FastAPI(title="Website Cloner API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -11,6 +16,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(clone_router)
+
+
 @app.get("/")
 def root():
-    return {"message": "Backend is running 🚀"}
+    return {"message": "Website Cloner API is running"}

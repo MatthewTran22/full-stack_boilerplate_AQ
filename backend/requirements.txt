@@ -1,4 +1,12 @@
 fastapi
-uvicorn
-sqlalchemy
+uvicorn[standard]
 pydantic
+python-dotenv
+httpx
+beautifulsoup4
+playwright
+Pillow
+openai
+supabase
+daytona-sdk
+python-multipart
