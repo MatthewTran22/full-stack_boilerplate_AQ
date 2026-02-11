@@ -4,7 +4,15 @@ export interface CloneHistoryItem {
   id: string;
   url: string;
   sandbox_url: string | null;
+  preview_url: string | null;
   created_at: string;
+}
+
+export interface ClonePaginatedResponse {
+  items: CloneHistoryItem[];
+  total: number;
+  page: number;
+  pages: number;
 }
 
 export interface CloneFile {
@@ -101,9 +109,9 @@ export async function startClone(
   }
 }
 
-export async function getClones(): Promise<CloneHistoryItem[]> {
-  const response = await fetch(`${API_URL}/api/clones`);
-  if (!response.ok) return [];
+export async function getClones(page = 1, perPage = 30): Promise<ClonePaginatedResponse> {
+  const response = await fetch(`${API_URL}/api/clones?page=${page}&per_page=${perPage}`);
+  if (!response.ok) return { items: [], total: 0, page, pages: 0 };
   return response.json();
 }
 

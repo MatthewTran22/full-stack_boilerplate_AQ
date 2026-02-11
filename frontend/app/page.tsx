@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { Highlight, themes } from "prism-react-renderer";
-import { startClone, getClones, getPreviewUrl, resolveApiUrl, type CloneHistoryItem, type CloneFile, type CloneEvent } from "@/lib/api";
+import { startClone, getClones, getPreviewUrl, resolveApiUrl, type CloneHistoryItem, type CloneFile, type CloneEvent, type ClonePaginatedResponse } from "@/lib/api";
 import {
   Globe,
   Loader2,
@@ -14,6 +14,7 @@ import {
   Check,
   X,
   Clock,
+  ChevronLeft,
   Sparkles,
   Search,
   Camera,
@@ -83,6 +84,9 @@ export default function Home() {
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<CloneHistoryItem[]>([]);
+  const [clonePage, setClonePage] = useState(1);
+  const [clonePages, setClonePages] = useState(0);
+  const [cloneTotal, setCloneTotal] = useState(0);
   const [copied, setCopied] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [expandedScreenshot, setExpandedScreenshot] = useState<string | null>(null);
@@ -97,8 +101,12 @@ export default function Home() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    getClones().then(setHistory).catch(() => {});
-  }, []);
+    getClones(clonePage, 30).then((res) => {
+      setHistory(res.items);
+      setClonePages(res.pages);
+      setCloneTotal(res.total);
+    }).catch(() => {});
+  }, [clonePage]);
 
   useEffect(() => {
     if (status === "idle") inputRef.current?.focus();
@@ -217,7 +225,12 @@ export default function Home() {
             setExpandedFolders(folders);
           }
           if (data.preview_url) setPreviewUrl(resolveApiUrl(data.preview_url));
-          getClones().then(setHistory).catch(() => {});
+          getClones(1, 30).then((res) => {
+            setHistory(res.items);
+            setClonePages(res.pages);
+            setCloneTotal(res.total);
+            setClonePage(1);
+          }).catch(() => {});
         } else if (data.status === "error") {
           setStatus("error");
           setError(data.message || "Unknown error");
@@ -241,7 +254,12 @@ export default function Home() {
   };
 
   const handleHistoryClick = (item: CloneHistoryItem) => {
-    setPreviewUrl(getPreviewUrl(item.id));
+    // For /api/static/ URLs, use the stored path (has correct storage UUID)
+    // For /api/preview/ or missing, use the DB ID which is always correct
+    const previewLink = item.preview_url?.includes("/api/static/")
+      ? resolveApiUrl(item.preview_url)
+      : getPreviewUrl(item.id);
+    setPreviewUrl(previewLink);
     setStatus("done");
     setUrl(item.url);
     setGeneratedFiles([]);
@@ -257,6 +275,17 @@ export default function Home() {
     setShowCode(false);
     setActiveFile(null);
     setLogEntries([]);
+  };
+
+  const timeAgo = (dateStr: string) => {
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
   };
 
   const isLoading = status === "scraping" || status === "generating" || status === "deploying";
@@ -360,7 +389,7 @@ export default function Home() {
   if (!showWorkspace) {
     return (
       <main className="min-h-screen flex flex-col">
-        <div className="flex-1 flex flex-col items-center justify-center px-4">
+        <div className={`flex-1 flex flex-col items-center px-4 ${history.length > 0 ? "pt-16" : "justify-center"}`}>
           <div className="mb-8 text-center">
             <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-primary/10 mb-6">
               <Globe className="w-8 h-8 text-primary" />
@@ -399,21 +428,72 @@ export default function Home() {
           </form>
 
           {history.length > 0 && (
-            <div className="mt-12 w-full max-w-xl">
-              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                <Clock className="w-3 h-3" /> Recent
+            <div className="mt-12 w-full max-w-6xl px-4">
+              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-4 flex items-center gap-1.5">
+                <Clock className="w-3 h-3" /> Recent clones
+                {cloneTotal > 0 && <span className="text-muted-foreground/50">({cloneTotal})</span>}
               </p>
-              <div className="flex flex-wrap gap-2">
-                {history.slice(0, 6).map((item) => (
-                  <button
-                    key={item.id}
-                    onClick={() => handleHistoryClick(item)}
-                    className="text-sm px-3 py-1.5 rounded-lg bg-secondary hover:bg-secondary/80 text-secondary-foreground truncate max-w-[220px] transition-colors"
-                  >
-                    {item.url.replace(/^https?:\/\//, "")}
-                  </button>
-                ))}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                {history.map((item) => {
+                  const domain = item.url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+                  return (
+                    <button
+                      key={item.id}
+                      onClick={() => handleHistoryClick(item)}
+                      className="group text-left p-4 rounded-xl bg-card border border-border hover:border-primary/40 hover:bg-primary/5 transition-all"
+                    >
+                      <div className="flex items-center gap-2 mb-2">
+                        <Globe className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
+                        <span className="text-sm font-semibold truncate">{domain}</span>
+                      </div>
+                      <span className="text-xs text-muted-foreground">{timeAgo(item.created_at)}</span>
+                    </button>
+                  );
+                })}
               </div>
+
+              {clonePages > 1 && (
+                <div className="flex items-center justify-center gap-1 mt-6">
+                  <button
+                    onClick={() => setClonePage((p) => Math.max(1, p - 1))}
+                    disabled={clonePage <= 1}
+                    className="p-2 rounded-lg text-sm text-muted-foreground hover:text-foreground hover:bg-secondary disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  {Array.from({ length: clonePages }, (_, i) => i + 1)
+                    .filter((p) => p === 1 || p === clonePages || Math.abs(p - clonePage) <= 1)
+                    .reduce<(number | "...")[]>((acc, p, idx, arr) => {
+                      if (idx > 0 && p - (arr[idx - 1]) > 1) acc.push("...");
+                      acc.push(p);
+                      return acc;
+                    }, [])
+                    .map((p, idx) =>
+                      p === "..." ? (
+                        <span key={`ellipsis-${idx}`} className="px-1 text-muted-foreground/50 text-sm">...</span>
+                      ) : (
+                        <button
+                          key={p}
+                          onClick={() => setClonePage(p)}
+                          className={`min-w-[32px] h-8 rounded-lg text-sm transition-colors ${
+                            clonePage === p
+                              ? "bg-primary text-primary-foreground font-medium"
+                              : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                          }`}
+                        >
+                          {p}
+                        </button>
+                      )
+                    )}
+                  <button
+                    onClick={() => setClonePage((p) => Math.min(clonePages, p + 1))}
+                    disabled={clonePage >= clonePages}
+                    className="p-2 rounded-lg text-sm text-muted-foreground hover:text-foreground hover:bg-secondary disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>

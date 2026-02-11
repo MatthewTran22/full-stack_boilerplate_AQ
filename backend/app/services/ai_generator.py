@@ -203,7 +203,7 @@ def build_prompt(
         '  - Every file starts with "use client" and exports a default function component.\n'
         "  - Keep each component under ~300 lines. If a section is large, split it further.\n"
         "  - app/page.tsx imports all section components and renders them in order.\n"
-        "  - Components import from @/components/ui/*, @/components/aceternity/*, lucide-react as needed.\n"
+        "  - Components import from lucide-react and @/lib/utils as needed.\n"
         "  - Components that need shared state (e.g. mobile menu) can use useState locally.\n"
         "- Must be valid TypeScript/JSX. Close all brackets. Use {'<'} or {'>'} for literal angle brackets in text.\n\n"
 
@@ -215,8 +215,8 @@ def build_prompt(
         "import { useState } from 'react';\n"
         "// 2. lucide-react icons — import EVERY icon you use (Star, ChevronDown, Menu, X, etc.)\n"
         "import { Star, ChevronDown, Menu, X } from 'lucide-react';\n"
-        "// 3. UI component imports\n"
-        "import { Button } from '@/components/ui/button';\n"
+        "// 3. Utility imports\n"
+        "import { cn } from '@/lib/utils';\n"
         "// 4. Section component imports (only in page.tsx)\n"
         "import Navbar from '@/components/Navbar';\n"
         "\n"
@@ -236,28 +236,39 @@ def build_prompt(
         "- Double-check: scan your JSX for any identifier starting with uppercase — each one MUST be imported.\n\n"
 
         "## Project structure (already set up in sandbox — DO NOT regenerate these)\n"
-        "The sandbox already has a fully configured Next.js 14 project:\n"
+        "The sandbox has a minimal Next.js 14 scaffold (9 files):\n"
         "```\n"
-        "app/layout.tsx          ← root layout (Inter font, Tailwind globals) — DO NOT OUTPUT\n"
-        "app/globals.css         ← Tailwind @import + CSS variables — DO NOT OUTPUT\n"
-        "components/ui/*.tsx     ← shadcn/ui components (button, card, badge, etc.) — DO NOT OUTPUT\n"
-        "components/aceternity/* ← animated components (spotlight, beams, etc.) — DO NOT OUTPUT\n"
-        "lib/utils.ts            ← cn() helper — DO NOT OUTPUT\n"
-        "package.json            ← all deps installed (react, next, tailwindcss, lucide-react, etc.) — DO NOT OUTPUT\n"
+        "package.json            ← base deps (react, next, tailwindcss, lucide-react, clsx, tailwind-merge, cva) — DO NOT OUTPUT\n"
+        "next.config.js          ← static export config — DO NOT OUTPUT\n"
         "tsconfig.json           ← @/* path alias maps to project root — DO NOT OUTPUT\n"
         "tailwind.config.ts      ← Tailwind config — DO NOT OUTPUT\n"
+        "postcss.config.js       ← PostCSS config — DO NOT OUTPUT\n"
+        "app/layout.tsx          ← root layout (Inter font, Tailwind globals) — DO NOT OUTPUT\n"
+        "app/globals.css         ← Tailwind @import + CSS variables — DO NOT OUTPUT\n"
+        "app/page.tsx            ← placeholder (you REPLACE this) — OUTPUT THIS\n"
+        "lib/utils.ts            ← cn() helper — DO NOT OUTPUT\n"
         "```\n"
-        "You generate ONLY:\n"
+        "There are NO pre-installed component libraries (no shadcn/ui, no aceternity). You generate ALL components from scratch.\n"
+        "You generate:\n"
         "  - app/page.tsx (imports and assembles your section components)\n"
         "  - components/<SectionName>.tsx (one per visual section: Navbar, Hero, Features, Footer, etc.)\n"
-        "All other project files already exist. NEVER output package.json, layout.tsx, globals.css, tsconfig, or any ui/* file.\n\n"
+        "NEVER output package.json, layout.tsx, globals.css, tsconfig, or any config file.\n\n"
 
         "## Tech stack\n"
         "- React 18 + Next.js 14 App Router + Tailwind CSS\n"
-        '- shadcn/ui: import from "@/components/ui/<name>" — available: button, card, badge, avatar, separator, accordion, tabs, input, textarea, navigation-menu, dialog, dropdown-menu, tooltip, select, checkbox, switch, progress, scroll-area, skeleton, table\n'
-        '- lucide-react: import { IconName } from "lucide-react"\n'
-        '- Aceternity UI: import from "@/components/aceternity/<name>" — available: moving-border, background-beams, spotlight, text-generate-effect, typewriter-effect, card-hover-effect, lamp-effect, wavy-background, infinite-moving-cards, meteors, bento-grid, sparkles, tabs, tracing-beam, hero-highlight\n'
-        '- import { cn } from "@/lib/utils"\n\n'
+        "- PREFER Tailwind-only styling. Build all UI components from scratch with Tailwind classes.\n"
+        "- NO pre-installed component libraries (no shadcn/ui, no aceternity, no Radix UI). Do NOT import from @/components/ui/* or @/components/aceternity/*.\n"
+        '- lucide-react: import { IconName } from "lucide-react" (pre-installed)\n'
+        '- import { cn } from "@/lib/utils" (pre-installed — merges Tailwind classes)\n'
+        "- class-variance-authority: import { cva } from 'class-variance-authority' (pre-installed — for component variants)\n\n"
+        "## Declaring extra npm dependencies\n"
+        "If you absolutely need an npm package that is NOT pre-installed (e.g. framer-motion, a Radix primitive),\n"
+        "declare it on a SINGLE line BEFORE your first // === FILE: ... === delimiter:\n"
+        "  // === DEPS: framer-motion, @radix-ui/react-dialog ===\n"
+        "Rules:\n"
+        "- Only declare deps you actually import in your code.\n"
+        "- PREFER Tailwind-only solutions. Most clones need ZERO extra deps.\n"
+        "- If you don't need extra deps, omit the DEPS line entirely.\n\n"
 
         "## PIXEL-PERFECT RULES (these are the highest priority)\n\n"
 
@@ -455,12 +466,25 @@ def _fix_missing_imports(content: str) -> str:
     return content
 
 
-def parse_multi_file_output(raw: str) -> list[dict]:
+def parse_multi_file_output(raw: str) -> dict:
     """Parse AI output into multiple files using // === FILE: path === delimiters.
 
+    Also extracts extra npm dependencies from a // === DEPS: pkg1, pkg2 === line.
+
+    Returns {"files": [{"path": ..., "content": ...}], "deps": ["pkg1", "pkg2"]}.
     Falls back to single page.tsx if no delimiters found.
     """
     raw = raw.strip()
+
+    # Extract optional DEPS declaration (before or between file delimiters)
+    deps: list[str] = []
+    deps_pattern = re.compile(r'^//\s*===\s*DEPS:\s*(.+?)\s*===\s*$', re.MULTILINE)
+    deps_match = deps_pattern.search(raw)
+    if deps_match:
+        deps = [d.strip() for d in deps_match.group(1).split(",") if d.strip()]
+        # Strip the DEPS line from raw so it doesn't interfere with file parsing
+        raw = raw[:deps_match.start()] + raw[deps_match.end():]
+        raw = raw.strip()
 
     # Try to find multi-file delimiters
     # Match: // === FILE: app/page.tsx ===
@@ -478,19 +502,13 @@ def parse_multi_file_output(raw: str) -> list[dict]:
             if code:
                 files.append({"path": path, "content": code})
         logger.info(f"Parsed {len(files)} files from multi-file output")
-        return files
+        return {"files": files, "deps": deps}
 
     # Fallback: single file
     logger.info("No multi-file delimiters found, treating as single page.tsx")
     content = _clean_code(raw)
-    return [{"path": "app/page.tsx", "content": content}] if content else []
-
-
-def get_used_components(tsx_content: str) -> dict[str, set[str]]:
-    """Scan TSX code for @/components/ui/* and @/components/aceternity/* imports."""
-    ui = re.findall(r"""from\s+['"]@/components/ui/([^'"]+)['"]""", tsx_content)
-    aceternity = re.findall(r"""from\s+['"]@/components/aceternity/([^'"]+)['"]""", tsx_content)
-    return {"ui": set(ui), "aceternity": set(aceternity)}
+    files = [{"path": "app/page.tsx", "content": content}] if content else []
+    return {"files": files, "deps": deps}
 
 
 async def generate_clone(
@@ -506,17 +524,17 @@ async def generate_clone(
     interactives: list[dict] | None = None,
     linked_pages: list[dict] | None = None,
     on_status=None,
-) -> list[dict]:
+) -> dict:
     """Generate a Next.js clone from HTML + viewport screenshots.
 
-    Returns a list of file dicts: [{"path": "app/page.tsx", "content": "..."}]
+    Returns {"files": [{"path": ..., "content": ...}], "deps": [...]}.
     """
     client = get_openrouter_client()
     n = len(screenshots)
 
     if not screenshots:
         logger.error("No screenshots provided — cannot generate clone")
-        return []
+        return {"files": [], "deps": []}
 
     prompt_len = len(html) + sum(len(u) for u in image_urls)
     logger.info(f"[ai] Generating clone: {n} screenshots, {len(html)} chars HTML, {len(image_urls)} images, ~{prompt_len // 1000}k prompt chars")
@@ -566,9 +584,14 @@ async def generate_clone(
     logger.info(f"[ai] Response: {len(raw_output)} chars in {t_elapsed:.1f}s | model={model} tokens_in={tokens_in} tokens_out={tokens_out}")
 
     if not raw_output:
-        return []
+        return {"files": [], "deps": []}
 
-    files = parse_multi_file_output(raw_output)
+    result = parse_multi_file_output(raw_output)
+    files = result["files"]
+    deps = result["deps"]
+
+    if deps:
+        logger.info(f"[ai] AI requested {len(deps)} extra dependencies: {', '.join(deps)}")
 
     if on_status:
         for f in files:
@@ -580,4 +603,4 @@ async def generate_clone(
                 "lines": line_count,
             })
 
-    return files
+    return result

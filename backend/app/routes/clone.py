@@ -4,39 +4,41 @@ import uuid
 import asyncio
 import logging
 import time
-
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 from app.services.scraper import scrape_and_capture
-from app.services.ai_generator import generate_clone, get_used_components
+from app.services.ai_generator import generate_clone
 from app.services.sandbox import (
     setup_sandbox_shell,
     upload_file_to_sandbox,
-    get_preview_files,
-    get_sandbox_base_url,
-    get_sandbox_logs,
-    release_clone,
-    _preview_store,
-    _clone_timestamps,
+    start_dev_server,
 )
 from app.services.template_loader import get_template_files
-from app.database import save_clone, get_clones, get_clone
+from app.database import (
+    save_clone,
+    get_clones,
+    get_clone,
+    download_static_file,
+    _guess_content_type,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 # ── Concurrency & rate limiting ──
-# Max simultaneous clone operations (each uses Playwright + AI + Daytona)
 MAX_CONCURRENT_CLONES = int(os.getenv("MAX_CONCURRENT_CLONES", "5"))
 _clone_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLONES)
 
-# Simple per-IP rate limiter: track last request time
+# Simple per-IP rate limiter
 _rate_limit_map: dict[str, float] = {}
-RATE_LIMIT_SECONDS = 10  # Min seconds between clone requests per IP
+RATE_LIMIT_SECONDS = 10
+
+# Map clone_id → Daytona sandbox preview URL (for proxying)
+_sandbox_urls: dict[str, str] = {}
 
 
 class CloneRequest(BaseModel):
@@ -47,9 +49,10 @@ def sse_event(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
+
 @router.post("/api/clone")
 async def clone_website(request: CloneRequest, raw_request: Request):
-    """Clone a website: scrape, screenshot, generate Next.js files with AI, deploy to sandbox."""
+    """Clone a website: scrape, screenshot, generate Next.js files, build static, upload to Supabase Storage."""
     url = request.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -67,11 +70,9 @@ async def clone_website(request: CloneRequest, raw_request: Request):
         logger.warning(f"[clone] Rejected request from {client_ip}: all {MAX_CONCURRENT_CLONES} slots busy")
         raise HTTPException(status_code=503, detail=f"Server busy — {MAX_CONCURRENT_CLONES} clones already in progress. Try again shortly.")
 
-    # Queue for status updates from both AI generator and sandbox setup
     status_queue: asyncio.Queue = asyncio.Queue()
 
     async def on_status(message):
-        """Accept both string messages and dict events."""
         await status_queue.put(message)
 
     async def event_stream():
@@ -105,7 +106,6 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 f"{len(html_source)} chars HTML, {len(image_urls)} images ({t_scrape:.1f}s)"
             )
 
-            # Send first screenshot to frontend for verification
             yield sse_event({
                 "status": "screenshot",
                 "message": f"Captured {len(screenshots)} viewport screenshots ({t_scrape:.0f}s)",
@@ -116,8 +116,6 @@ async def clone_website(request: CloneRequest, raw_request: Request):
             yield sse_event({"status": "generating", "message": "AI is generating the clone..."})
             t1 = time.time()
 
-            # Start sandbox setup immediately (don't wait for AI)
-            # Upload ALL template files — we'll add the generated code after
             all_template_files = get_template_files()
 
             async def _setup_sandbox():
@@ -129,13 +127,13 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                     )
                 except Exception as e:
                     logger.error(f"[clone:{clone_id}] Sandbox setup failed: {e}")
-                    return None
+                    return False
 
             sandbox_task = asyncio.create_task(_setup_sandbox())
 
             # Run AI generation concurrently
             try:
-                files = await generate_clone(
+                ai_result = await generate_clone(
                     html=html_source,
                     screenshots=screenshots,
                     image_urls=image_urls,
@@ -149,6 +147,7 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                     linked_pages=scraped_linked_pages,
                     on_status=on_status,
                 )
+                files = ai_result["files"]
             except Exception as e:
                 logger.error(f"[clone:{clone_id}] AI generation failed: {e}")
                 sandbox_task.cancel()
@@ -173,17 +172,18 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                     "lines": line_count,
                 })
 
-            # Wait for sandbox to be ready (may already be done)
+            # Wait for sandbox to be ready
             yield sse_event({"status": "deploying", "message": "Waiting for sandbox..."})
             t2 = time.time()
-            sandbox_url = await sandbox_task
-            t_sandbox = time.time() - t1
+            sandbox_ready = await sandbox_task
             t_sandbox_wait = time.time() - t2
-            logger.info(f"[clone:{clone_id}] Sandbox ready (waited {t_sandbox_wait:.1f}s after AI, {t_sandbox:.1f}s total parallel)")
+            logger.info(f"[clone:{clone_id}] Sandbox ready={sandbox_ready} (waited {t_sandbox_wait:.1f}s)")
 
-            # Step 3: Upload generated files AFTER sandbox is ready
-            if sandbox_url:
-                yield sse_event({"status": "deploying", "message": "Uploading generated code..."})
+            preview_url = None
+
+            if sandbox_ready:
+                # Upload generated files to sandbox
+                yield sse_event({"status": "deploying", "message": "Uploading generated code to sandbox..."})
 
                 for f in files:
                     success = upload_file_to_sandbox(clone_id, f["path"], f["content"])
@@ -193,15 +193,27 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                             "message": f"Uploaded {f['path']}",
                             "file": f["path"],
                         })
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05)
 
-                # Wait for Next.js to compile the new code
-                yield sse_event({"status": "deploying", "message": "Compiling..."})
-                await asyncio.sleep(5)
+                # Start dev server and get live preview URL
+                yield sse_event({"status": "deploying", "message": "Starting live preview..."})
+                dev_url = await start_dev_server(
+                    clone_id=clone_id,
+                    on_status=on_status,
+                )
 
-                logs = get_sandbox_logs(clone_id)
-                if logs and ("error" in logs.lower() or "Error" in logs):
-                    logger.warning(f"[clone:{clone_id}] Sandbox compile issues:\n{logs[-1000:]}")
+                if dev_url:
+                    _sandbox_urls[clone_id] = dev_url
+                    preview_url = f"/api/sandbox/{clone_id}/"
+                    logger.info(f"[clone:{clone_id}] Live preview proxied at {preview_url} → {dev_url}")
+                else:
+                    logger.warning(f"[clone:{clone_id}] Dev server failed to start")
+                    yield sse_event({"status": "error", "message": "Preview failed to start"})
+                    return
+            else:
+                logger.warning(f"[clone:{clone_id}] No sandbox available")
+                yield sse_event({"status": "error", "message": "Sandbox unavailable"})
+                return
 
             t_total = time.time() - t0
             total_lines = sum(f["content"].count("\n") + 1 for f in files)
@@ -211,36 +223,15 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 f"| {len(files)} files, {total_lines} lines"
             )
 
-            # Step 5: Save to database
-            _preview_store[clone_id] = files
-            combined_html = "\n".join(
-                f"// === {f['path']} ===\n{f['content']}" for f in files
-            )
-            if sandbox_url:
-                preview_url = f"/api/sandbox/{clone_id}/"
-            else:
-                preview_url = f"/api/preview/{clone_id}"
-
+            # Only save to DB if we have a working preview
             db_record = await save_clone(
                 url=url,
-                generated_html=combined_html,
-                sandbox_url=sandbox_url,
+                preview_url=preview_url,
             )
 
             if db_record and "id" in db_record:
-                old_clone_id = clone_id
                 clone_id = db_record["id"]
-                logger.info(f"[clone:{clone_id}] Remapped from temp ID {old_clone_id[:8]}...")
-                # Re-key all sandbox mappings to the DB-assigned ID
-                from app.services.sandbox import _sandbox_urls, _sandbox_instances, _sandbox_project_dirs
-                for store in [_sandbox_urls, _sandbox_instances, _sandbox_project_dirs, _preview_store, _clone_timestamps]:
-                    if old_clone_id in store:
-                        store[clone_id] = store.pop(old_clone_id)
-                _preview_store[clone_id] = files
-                if sandbox_url:
-                    preview_url = f"/api/sandbox/{clone_id}/"
-                else:
-                    preview_url = f"/api/preview/{clone_id}"
+                logger.info(f"[clone:{clone_id}] Saved to database")
 
             # Build file list for the frontend code viewer
             file_list = [
@@ -252,7 +243,6 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 for f in files
             ]
 
-            # Scaffold paths for the frontend file tree (template files already in sandbox)
             scaffold_paths = sorted(set(tf["path"] for tf in all_template_files))
 
             yield sse_event({
@@ -286,52 +276,111 @@ async def clone_website(request: CloneRequest, raw_request: Request):
     )
 
 
+@router.get("/api/static/{clone_id}/{path:path}")
+async def serve_static(clone_id: str, path: str):
+    """Serve static files from Supabase Storage for a clone.
+
+    Handles path rewriting for _next/ assets in HTML/JS responses.
+    """
+    # Default to index.html for root/empty path
+    if not path or path == "/" or path.endswith("/"):
+        path = path.rstrip("/")
+        path = f"{path}/index.html" if path else "index.html"
+        path = path.lstrip("/")
+
+    data = download_static_file(clone_id, path)
+
+    # If not found and no extension, try path/index.html (Next.js static pages)
+    if data is None and "." not in path.split("/")[-1]:
+        data = download_static_file(clone_id, f"{path}/index.html")
+        if data is None:
+            data = download_static_file(clone_id, f"{path}.html")
+
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    content_type = _guess_content_type(path)
+    proxy_base = f"/api/static/{clone_id}"
+
+    # For HTML responses, rewrite /_next/ paths to go through our proxy
+    if "text/html" in content_type:
+        body = data.decode("utf-8", errors="replace")
+        body = body.replace('"/_next/', f'"{proxy_base}/_next/')
+        body = body.replace("'/_next/", f"'{proxy_base}/_next/")
+        return HTMLResponse(content=body)
+
+    # For JS responses, rewrite chunk loading paths
+    if "javascript" in content_type:
+        body = data.decode("utf-8", errors="replace")
+        body = body.replace('"/_next/', f'"{proxy_base}/_next/')
+        body = body.replace("\"/_next/", f"\"{proxy_base}/_next/")
+        body = body.replace("'/_next/", f"'{proxy_base}/_next/")
+        return Response(content=body.encode("utf-8"), media_type=content_type)
+
+    # Everything else (CSS, images, fonts) pass through as-is
+    return Response(content=data, media_type=content_type)
+
+
+@router.get("/api/sandbox/{clone_id}/{path:path}")
+async def proxy_sandbox(clone_id: str, path: str):
+    """Reverse-proxy requests to the Daytona sandbox dev server.
+
+    Bypasses Daytona's preview warning interstitial.
+    """
+    base_url = _sandbox_urls.get(clone_id)
+    if not base_url:
+        raise HTTPException(status_code=404, detail="Sandbox not found")
+
+    target = f"{base_url.rstrip('/')}/{path}"
+    proxy_base = f"/api/sandbox/{clone_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(target)
+    except Exception as e:
+        logger.error(f"[proxy:{clone_id}] Failed to fetch {target}: {e}")
+        raise HTTPException(status_code=502, detail="Sandbox unreachable")
+
+    content_type = resp.headers.get("content-type", "")
+
+    # Rewrite asset paths in HTML so they go through our proxy
+    if "text/html" in content_type:
+        body = resp.text
+        body = body.replace('"/_next/', f'"{proxy_base}/_next/')
+        body = body.replace("'/_next/", f"'{proxy_base}/_next/")
+        return HTMLResponse(content=body, status_code=resp.status_code)
+
+    # Rewrite JS chunk loading paths
+    if "javascript" in content_type:
+        body = resp.text
+        body = body.replace('"/_next/', f'"{proxy_base}/_next/')
+        body = body.replace("'/_next/", f"'{proxy_base}/_next/")
+        return Response(content=body.encode("utf-8"), media_type=content_type)
+
+    return Response(content=resp.content, media_type=content_type, status_code=resp.status_code)
+
+
 @router.get("/api/preview/{clone_id}")
 async def preview_clone(clone_id: str):
-    """Serve a combined HTML preview of generated files (fallback when no sandbox)."""
-    files = get_preview_files(clone_id)
+    """Redirect to sandbox proxy or static preview."""
+    if clone_id in _sandbox_urls:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=f"/api/sandbox/{clone_id}/")
 
-    if files is None:
-        record = await get_clone(clone_id)
-        if record:
-            html = record.get("generated_html")
-            if html:
-                return HTMLResponse(content=html)
+    record = await get_clone(clone_id)
+    if record and record.get("preview_url", "").startswith("/api/"):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=record["preview_url"])
 
-    if files is None:
-        raise HTTPException(status_code=404, detail="Clone not found")
-
-    # Find the page.tsx content and render as simple HTML for preview
-    page_content = ""
-    for f in files:
-        if f["path"].endswith("page.tsx"):
-            page_content = f["content"]
-            break
-
-    if not page_content:
-        page_content = "\n".join(f["content"] for f in files)
-
-    # Wrap in a basic HTML page for preview
-    preview_html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Preview</title>
-<script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body>
-<pre style="padding: 2rem; font-family: monospace; font-size: 14px; white-space: pre-wrap;">{page_content}</pre>
-</body>
-</html>"""
-
-    return HTMLResponse(content=preview_html)
+    raise HTTPException(status_code=404, detail="Clone not found")
 
 
 @router.get("/api/clones")
-async def list_clones():
-    """List all clone history."""
-    return await get_clones()
+async def list_clones(page: int = 1, per_page: int = 30):
+    """List clone history with pagination."""
+    page = max(1, page)
+    per_page = max(1, min(100, per_page))
+    return await get_clones(page=page, per_page=per_page)
 
 
 @router.get("/api/clones/{clone_id}")
@@ -341,57 +390,5 @@ async def get_clone_detail(clone_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Clone not found")
 
-    record["preview_url"] = record.get("sandbox_url") or f"/api/preview/{clone_id}"
+    record["preview_url"] = record.get("preview_url") or f"/api/preview/{clone_id}"
     return record
-
-
-@router.get("/api/sandbox/{clone_id}/{path:path}")
-async def proxy_sandbox(clone_id: str, path: str, request: Request):
-    """Reverse proxy to Daytona sandbox, adding the skip-warning header."""
-    base_url = get_sandbox_base_url(clone_id)
-    if not base_url:
-        raise HTTPException(status_code=404, detail="Sandbox not found")
-
-    # Strip trailing slash from base, ensure path starts clean
-    target = f"{base_url.rstrip('/')}/{path}"
-
-    # Forward query string if present
-    if request.url.query:
-        target += f"?{request.url.query}"
-
-    headers = {"X-Daytona-Skip-Preview-Warning": "true"}
-
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        resp = await client.get(target, headers=headers)
-
-    if resp.status_code >= 500:
-        logger.error(f"Sandbox 500 for {path}: {resp.text[:1000]}")
-
-    content_type = resp.headers.get("content-type", "")
-
-    proxy_base = f"/api/sandbox/{clone_id}"
-
-    # For HTML responses, rewrite /_next/ paths to go through our proxy
-    if "text/html" in content_type:
-        body = resp.text
-        body = body.replace('"/_next/', f'"{proxy_base}/_next/')
-        body = body.replace("'/_next/", f"'{proxy_base}/_next/")
-        return HTMLResponse(content=body, status_code=resp.status_code)
-
-    # For JS responses, rewrite chunk loading paths so webpack loads through proxy
-    if "javascript" in content_type:
-        body = resp.text
-        # Rewrite webpack's dynamic chunk loading paths
-        body = body.replace('"/_next/', f'"{proxy_base}/_next/')
-        body = body.replace("\"/_next/", f"\"{proxy_base}/_next/")
-        body = body.replace("'/_next/", f"'{proxy_base}/_next/")
-        # Rewrite the public path webpack uses for chunk loading
-        body = body.replace('"static/', f'"{proxy_base}/_next/static/')
-        return Response(content=body.encode(), status_code=resp.status_code, media_type=content_type)
-
-    # For everything else (CSS, images, fonts, etc.), pass through as-is
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        media_type=content_type,
-    )
