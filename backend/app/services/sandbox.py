@@ -162,6 +162,12 @@ def upload_file_to_sandbox(clone_id: str, file_path: str, content: str) -> bool:
 
     try:
         full_path = f"{project_dir}/{file_path}"
+        # Ensure parent directory exists
+        parent_dir = "/".join(full_path.split("/")[:-1])
+        try:
+            sandbox.process.exec(f"mkdir -p {parent_dir}", timeout=5)
+        except Exception:
+            pass
         sandbox.fs.upload_file(
             content.encode("utf-8"),
             full_path,
@@ -179,7 +185,7 @@ def get_sandbox_logs(clone_id: str) -> str | None:
     if not sandbox:
         return None
     try:
-        result = sandbox.process.exec("tail -50 /tmp/next.log", timeout=5)
+        result = sandbox.process.exec("tail -100 /tmp/next.log", timeout=5)
         return result.result if result.result else None
     except Exception as e:
         logger.warning(f"Failed to read sandbox logs for {clone_id}: {e}")

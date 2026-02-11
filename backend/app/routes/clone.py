@@ -2,6 +2,7 @@ import json
 import uuid
 import asyncio
 import logging
+import time
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -9,7 +10,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 from app.services.scraper import scrape_and_capture
-from app.services.ai_generator import generate_clone
+from app.services.ai_generator import generate_clone, get_used_components
 from app.services.sandbox import (
     setup_sandbox_shell,
     upload_file_to_sandbox,
@@ -54,25 +55,34 @@ async def clone_website(request: CloneRequest):
         try:
             # Step 1: Scrape the website (HTML + viewport screenshots + image URLs)
             yield sse_event({"status": "scraping", "message": "Scraping website..."})
+            t0 = time.time()
             try:
                 scrape_result = await scrape_and_capture(url)
                 screenshots = scrape_result["screenshots"]
                 html_source = scrape_result["html"]
                 image_urls = scrape_result["image_urls"]
+                scraped_styles = scrape_result.get("styles")
+                font_links = scrape_result.get("font_links", [])
+                scraped_icons = scrape_result.get("icons")
+                scraped_svgs = scrape_result.get("svgs", [])
+                scraped_logos = scrape_result.get("logos", [])
             except Exception as e:
                 logger.error(f"Scraping failed: {e}")
                 yield sse_event({"status": "error", "message": f"Failed to scrape website: {e}"})
                 return
+            t_scrape = time.time() - t0
+            logger.info(f"TIMING: Scrape took {t_scrape:.1f}s ({len(screenshots)} screenshots)")
 
             # Send first screenshot to frontend for verification
             yield sse_event({
                 "status": "screenshot",
-                "message": f"Captured {len(screenshots)} viewport screenshots",
+                "message": f"Captured {len(screenshots)} viewport screenshots ({t_scrape:.0f}s)",
                 "screenshot": screenshots[0] if screenshots else "",
             })
 
             # Step 2: Generate code with AI FIRST
             yield sse_event({"status": "generating", "message": "AI is generating the clone..."})
+            t1 = time.time()
 
             try:
                 files = await generate_clone(
@@ -80,12 +90,19 @@ async def clone_website(request: CloneRequest):
                     screenshots=screenshots,
                     image_urls=image_urls,
                     url=url,
+                    styles=scraped_styles,
+                    font_links=font_links,
+                    icons=scraped_icons,
+                    svgs=scraped_svgs,
+                    logos=scraped_logos,
                     on_status=on_status,
                 )
             except Exception as e:
                 logger.error(f"AI generation failed: {e}")
                 yield sse_event({"status": "error", "message": str(e)})
                 return
+            t_ai = time.time() - t1
+            logger.info(f"TIMING: AI generation took {t_ai:.1f}s")
 
             if not files:
                 yield sse_event({"status": "error", "message": "AI returned no files"})
@@ -103,10 +120,45 @@ async def clone_website(request: CloneRequest):
                 })
 
             # Step 3: Set up sandbox with template + generated code
-            yield sse_event({"status": "deploying", "message": "Setting up sandbox..."})
+            # Scan ALL generated files for component imports
+            all_code = "\n".join(f["content"] for f in files)
+            used = get_used_components(all_code)
+            used_ui = used["ui"]
+            used_aceternity = used["aceternity"]
+            logger.info(f"shadcn components used: {used_ui or 'none'}")
+            logger.info(f"aceternity components used: {used_aceternity or 'none'}")
 
-            template_files = get_template_files()
+            all_template_files = get_template_files()
+
+            # Filter: keep everything except unused component library files
+            template_files = []
+            for tf in all_template_files:
+                if tf["path"].startswith("components/ui/"):
+                    comp_name = tf["path"].replace("components/ui/", "").replace(".tsx", "")
+                    if comp_name in used_ui:
+                        template_files.append(tf)
+                        logger.info(f"Including shadcn: {comp_name}")
+                elif tf["path"].startswith("components/aceternity/"):
+                    comp_name = tf["path"].replace("components/aceternity/", "").replace(".tsx", "")
+                    if comp_name in used_aceternity:
+                        template_files.append(tf)
+                        logger.info(f"Including aceternity: {comp_name}")
+                else:
+                    template_files.append(tf)
+
+            # Always include lib/utils.ts if any components are used
+            if used_ui or used_aceternity:
+                has_utils = any(tf["path"] == "lib/utils.ts" for tf in template_files)
+                if not has_utils:
+                    for tf in all_template_files:
+                        if tf["path"] == "lib/utils.ts":
+                            template_files.append(tf)
+                            break
+
+            total_components = len(used_ui) + len(used_aceternity)
+            yield sse_event({"status": "deploying", "message": f"Setting up sandbox ({total_components} UI components)..."})
             sandbox_url = None
+            t2 = time.time()
 
             try:
                 sandbox_url = await setup_sandbox_shell(
@@ -116,6 +168,8 @@ async def clone_website(request: CloneRequest):
                 )
             except Exception as e:
                 logger.warning(f"Sandbox setup failed: {e}")
+            t_sandbox = time.time() - t2
+            logger.info(f"TIMING: Sandbox setup took {t_sandbox:.1f}s")
 
             # Step 4: Upload generated files AFTER sandbox is ready
             if sandbox_url:
@@ -137,7 +191,10 @@ async def clone_website(request: CloneRequest):
 
                 logs = get_sandbox_logs(clone_id)
                 if logs:
-                    logger.info(f"Sandbox next.log (last 500 chars):\n{logs[-500:]}")
+                    logger.info(f"Sandbox next.log (last 2000 chars):\n{logs[-2000:]}")
+
+            t_total = time.time() - t0
+            logger.info(f"TIMING TOTAL: {t_total:.1f}s (scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox={t_sandbox:.1f}s)")
 
             # Step 5: Save to database
             _preview_store[clone_id] = files
@@ -156,9 +213,22 @@ async def clone_website(request: CloneRequest):
             )
 
             if db_record and "id" in db_record:
+                old_clone_id = clone_id
                 clone_id = db_record["id"]
-                if not sandbox_url:
-                    _preview_store[clone_id] = files
+                # Re-key all sandbox mappings to the DB-assigned ID
+                from app.services.sandbox import _sandbox_urls, _sandbox_instances, _sandbox_project_dirs
+                if old_clone_id in _sandbox_urls:
+                    _sandbox_urls[clone_id] = _sandbox_urls.pop(old_clone_id)
+                if old_clone_id in _sandbox_instances:
+                    _sandbox_instances[clone_id] = _sandbox_instances.pop(old_clone_id)
+                if old_clone_id in _sandbox_project_dirs:
+                    _sandbox_project_dirs[clone_id] = _sandbox_project_dirs.pop(old_clone_id)
+                if old_clone_id in _preview_store:
+                    _preview_store[clone_id] = _preview_store.pop(old_clone_id)
+                _preview_store[clone_id] = files
+                if sandbox_url:
+                    preview_url = f"/api/sandbox/{clone_id}/"
+                else:
                     preview_url = f"/api/preview/{clone_id}"
 
             # Build file list for the frontend code viewer
@@ -281,15 +351,27 @@ async def proxy_sandbox(clone_id: str, path: str, request: Request):
 
     content_type = resp.headers.get("content-type", "")
 
+    proxy_base = f"/api/sandbox/{clone_id}"
+
     # For HTML responses, rewrite /_next/ paths to go through our proxy
     if "text/html" in content_type:
         body = resp.text
-        proxy_base = f"/api/sandbox/{clone_id}"
         body = body.replace('"/_next/', f'"{proxy_base}/_next/')
         body = body.replace("'/_next/", f"'{proxy_base}/_next/")
         return HTMLResponse(content=body, status_code=resp.status_code)
 
-    # For everything else (JS, CSS, images, etc.), pass through as-is
+    # For JS responses, rewrite chunk loading paths so webpack loads through proxy
+    if "javascript" in content_type:
+        body = resp.text
+        # Rewrite webpack's dynamic chunk loading paths
+        body = body.replace('"/_next/', f'"{proxy_base}/_next/')
+        body = body.replace("\"/_next/", f"\"{proxy_base}/_next/")
+        body = body.replace("'/_next/", f"'{proxy_base}/_next/")
+        # Rewrite the public path webpack uses for chunk loading
+        body = body.replace('"static/', f'"{proxy_base}/_next/static/')
+        return Response(content=body.encode(), status_code=resp.status_code, media_type=content_type)
+
+    # For everything else (CSS, images, fonts, etc.), pass through as-is
     return Response(
         content=resp.content,
         status_code=resp.status_code,

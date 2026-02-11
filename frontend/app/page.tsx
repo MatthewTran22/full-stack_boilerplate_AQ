@@ -374,7 +374,7 @@ export default function Home() {
       {/* Main workspace */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left: Activity log */}
-        <div className="w-80 shrink-0 border-r bg-card/50 flex flex-col">
+        <div className="w-80 shrink-0 border-r bg-card flex flex-col z-10">
           <div className="px-4 py-3 border-b">
             <h2 className="text-sm font-semibold flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-primary" />
@@ -492,12 +492,14 @@ export default function Home() {
 
           {/* Live preview — shown as soon as sandbox is ready, even while still loading */}
           {isLoading && previewUrl && (
-            <iframe
-              src={previewUrl}
-              className="w-full h-full border-0"
-              title="Cloned website preview"
-              sandbox="allow-scripts allow-same-origin"
-            />
+            <div className="flex-1 relative">
+              <iframe
+                src={previewUrl}
+                className="absolute inset-0 w-full h-full border-0"
+                title="Cloned website preview"
+                sandbox="allow-scripts allow-same-origin"
+              />
+            </div>
           )}
 
           {status === "error" && (
@@ -520,12 +522,14 @@ export default function Home() {
 
           {/* Preview mode */}
           {hasResult && !showCode && previewUrl && (
-            <iframe
-              src={previewUrl}
-              className="w-full h-full border-0"
-              title="Cloned website preview"
-              sandbox="allow-scripts allow-same-origin"
-            />
+            <div className="flex-1 relative">
+              <iframe
+                src={previewUrl}
+                className="absolute inset-0 w-full h-full border-0"
+                title="Cloned website preview"
+                sandbox="allow-scripts allow-same-origin"
+              />
+            </div>
           )}
           {hasResult && !showCode && !previewUrl && generatedFiles.length > 0 && (
             <div className="flex-1 flex items-center justify-center bg-muted/20">
