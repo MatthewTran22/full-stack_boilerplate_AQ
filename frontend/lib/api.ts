@@ -19,6 +19,7 @@ export interface CloneEvent {
   preview_url?: string;
   clone_id?: string;
   files?: CloneFile[];
+  scaffold_paths?: string[];
   // file_write event fields
   type?: string;
   file?: string;

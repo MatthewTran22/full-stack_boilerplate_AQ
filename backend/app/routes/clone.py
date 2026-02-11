@@ -252,12 +252,16 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 for f in files
             ]
 
+            # Scaffold paths for the frontend file tree (template files already in sandbox)
+            scaffold_paths = sorted(set(tf["path"] for tf in all_template_files))
+
             yield sse_event({
                 "status": "done",
                 "message": "Clone complete!",
                 "preview_url": preview_url,
                 "clone_id": clone_id,
                 "files": file_list,
+                "scaffold_paths": scaffold_paths,
             })
 
         except HTTPException:

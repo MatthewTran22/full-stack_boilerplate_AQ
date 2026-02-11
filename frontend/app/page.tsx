@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import { Highlight, themes } from "prism-react-renderer";
 import { startClone, getClones, getPreviewUrl, resolveApiUrl, type CloneHistoryItem, type CloneFile, type CloneEvent } from "@/lib/api";
 import {
   Globe,
@@ -24,6 +25,7 @@ import {
   ChevronRight,
   PanelLeftClose,
   PanelLeftOpen,
+  Folder,
 } from "lucide-react";
 
 type CloneStatus = "idle" | "scraping" | "generating" | "deploying" | "done" | "error";
@@ -85,6 +87,8 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [expandedScreenshot, setExpandedScreenshot] = useState<string | null>(null);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const [scaffoldPaths, setScaffoldPaths] = useState<string[]>([]);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [elapsed, setElapsed] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -202,6 +206,19 @@ export default function Home() {
             setGeneratedFiles(data.files);
             setActiveFile(data.files[0].path);
           }
+          if (data.scaffold_paths) {
+            setScaffoldPaths(data.scaffold_paths);
+            // Auto-expand folders that contain generated files
+            const genPaths = (data.files || []).map((f: CloneFile) => f.path);
+            const folders = new Set<string>();
+            for (const p of genPaths) {
+              const parts = p.split("/");
+              for (let i = 1; i < parts.length; i++) {
+                folders.add(parts.slice(0, i).join("/"));
+              }
+            }
+            setExpandedFolders(folders);
+          }
           if (data.preview_url) setPreviewUrl(resolveApiUrl(data.preview_url));
           getClones().then(setHistory).catch(() => {});
         } else if (data.status === "error") {
@@ -250,6 +267,97 @@ export default function Home() {
   const showWorkspace = isLoading || hasResult || status === "error";
 
   const currentFileContent = generatedFiles.find((f) => f.path === activeFile)?.content || "";
+
+  // ── Build nested file tree from scaffold + generated files ──
+  type TreeNode = { name: string; path: string; type: "file" | "folder"; generated: boolean; children: TreeNode[] };
+
+  const fileTree = (() => {
+    const root: TreeNode = { name: "", path: "", type: "folder", generated: false, children: [] };
+    const genPaths = new Set(generatedFiles.map((f) => f.path));
+
+    function ensureFolder(parts: string[]): TreeNode {
+      let current = root;
+      let currentPath = "";
+      for (const part of parts) {
+        currentPath = currentPath ? `${currentPath}/${part}` : part;
+        let child = current.children.find((c) => c.name === part && c.type === "folder");
+        if (!child) {
+          child = { name: part, path: currentPath, type: "folder", generated: false, children: [] };
+          current.children.push(child);
+        }
+        current = child;
+      }
+      return current;
+    }
+
+    function addFile(filePath: string, generated: boolean) {
+      const parts = filePath.split("/");
+      const fileName = parts.pop()!;
+      const folder = ensureFolder(parts);
+      if (!folder.children.find((c) => c.name === fileName && c.type === "file")) {
+        folder.children.push({ name: fileName, path: filePath, type: "file", generated, children: [] });
+      }
+    }
+
+    for (const p of scaffoldPaths) addFile(p, false);
+    for (const f of generatedFiles) addFile(f.path, true);
+
+    function sortTree(nodes: TreeNode[]) {
+      nodes.sort((a, b) => {
+        if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      for (const n of nodes) if (n.children.length) sortTree(n.children);
+    }
+    sortTree(root.children);
+    return root.children;
+  })();
+
+  const toggleFolder = (path: string) => {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      next.has(path) ? next.delete(path) : next.add(path);
+      return next;
+    });
+  };
+
+  const renderTreeNode = (node: TreeNode, depth: number): React.ReactNode => {
+    if (node.type === "folder") {
+      const isOpen = expandedFolders.has(node.path);
+      return (
+        <div key={node.path}>
+          <button
+            onClick={() => toggleFolder(node.path)}
+            className="w-full flex items-center gap-1.5 py-1 text-left text-xs text-muted-foreground hover:text-foreground hover:bg-secondary/30 transition-colors"
+            style={{ paddingLeft: depth * 12 + 8 }}
+          >
+            <ChevronRight className={`w-3 h-3 shrink-0 transition-transform ${isOpen ? "rotate-90" : ""}`} />
+            <Folder className="w-3.5 h-3.5 shrink-0 text-blue-400/70" />
+            <span className="truncate font-mono">{node.name}</span>
+          </button>
+          {isOpen && node.children.map((child) => renderTreeNode(child, depth + 1))}
+        </div>
+      );
+    }
+    return (
+      <button
+        key={node.path}
+        onClick={() => node.generated && setActiveFile(node.path)}
+        className={`w-full flex items-center gap-1.5 py-1 text-left text-xs transition-colors ${
+          activeFile === node.path
+            ? "bg-primary/10 text-foreground"
+            : node.generated
+              ? "text-muted-foreground hover:text-foreground hover:bg-secondary/30 cursor-pointer"
+              : "text-muted-foreground/40 cursor-default"
+        }`}
+        style={{ paddingLeft: depth * 12 + 20 }}
+      >
+        <FileCode2 className="w-3 h-3 shrink-0" />
+        <span className="truncate font-mono">{node.name}</span>
+        {node.generated && <span className="ml-auto text-[10px] text-green-400/60 shrink-0 pr-2">AI</span>}
+      </button>
+    );
+  };
 
   // ── Idle: centered landing ──
   if (!showWorkspace) {
@@ -593,43 +701,60 @@ export default function Home() {
               {/* File tree sidebar */}
               <div className="w-56 shrink-0 border-r bg-[hsl(220,13%,5%)] overflow-y-auto">
                 <div className="px-3 py-2 border-b border-border/50">
-                  <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Files</p>
+                  <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Explorer</p>
                 </div>
                 <div className="py-1">
-                  {generatedFiles.map((file) => (
-                    <button
-                      key={file.path}
-                      onClick={() => setActiveFile(file.path)}
-                      className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-sm transition-colors ${
-                        activeFile === file.path
-                          ? "bg-primary/10 text-foreground"
-                          : "text-muted-foreground hover:text-foreground hover:bg-secondary/30"
-                      }`}
-                    >
-                      <FileCode2 className="w-3.5 h-3.5 shrink-0" />
-                      <span className="truncate font-mono text-xs">{file.path}</span>
-                      <ChevronRight className={`w-3 h-3 ml-auto shrink-0 transition-transform ${
-                        activeFile === file.path ? "rotate-90" : ""
-                      }`} />
-                    </button>
-                  ))}
+                  {fileTree.length > 0
+                    ? fileTree.map((node) => renderTreeNode(node, 0))
+                    : generatedFiles.map((file) => (
+                        <button
+                          key={file.path}
+                          onClick={() => setActiveFile(file.path)}
+                          className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-sm transition-colors ${
+                            activeFile === file.path
+                              ? "bg-primary/10 text-foreground"
+                              : "text-muted-foreground hover:text-foreground hover:bg-secondary/30"
+                          }`}
+                        >
+                          <FileCode2 className="w-3.5 h-3.5 shrink-0" />
+                          <span className="truncate font-mono text-xs">{file.path}</span>
+                        </button>
+                      ))
+                  }
                 </div>
               </div>
 
-              {/* File content */}
-              <div className="flex-1 overflow-auto bg-[hsl(220,13%,3%)]">
+              {/* File content with syntax highlighting */}
+              <div className="flex-1 overflow-auto bg-[#0d1117]">
                 {activeFile && (
                   <div>
-                    <div className="sticky top-0 z-10 flex items-center gap-2 px-4 py-2 bg-[hsl(220,13%,5%)] border-b border-border/50">
-                      <FileCode2 className="w-3.5 h-3.5 text-muted-foreground" />
-                      <span className="text-xs font-mono text-muted-foreground">{activeFile}</span>
-                      <span className="text-xs font-mono text-green-400 ml-auto">
+                    <div className="sticky top-0 z-10 flex items-center gap-2 px-4 py-1.5 bg-[#161b22] border-b border-[#30363d]">
+                      <FileCode2 className="w-3.5 h-3.5 text-[#8b949e]" />
+                      <span className="text-xs font-mono text-[#8b949e]">{activeFile}</span>
+                      <span className="text-xs font-mono text-[#3fb950] ml-auto">
                         {generatedFiles.find(f => f.path === activeFile)?.lines || 0} lines
                       </span>
                     </div>
-                    <pre className="p-4 text-sm font-mono leading-relaxed whitespace-pre-wrap">
-                      <code className="text-muted-foreground">{currentFileContent}</code>
-                    </pre>
+                    <Highlight theme={themes.nightOwl} code={currentFileContent} language="tsx">
+                      {({ tokens, getTokenProps }) => (
+                        <pre className="text-[13px] leading-[1.6] m-0 p-0 overflow-x-auto" style={{ background: "#0d1117" }}>
+                          <code className="block">
+                            {tokens.map((line, i) => (
+                              <div key={i} className="flex hover:bg-[#161b22]" style={{ minHeight: "1.6em" }}>
+                                <span className="shrink-0 w-12 text-right pr-4 select-none text-[#484f58] text-xs leading-[1.6]" style={{ paddingTop: "0.1em" }}>
+                                  {i + 1}
+                                </span>
+                                <span className="flex-1 pr-4 whitespace-pre">
+                                  {line.map((token, key) => (
+                                    <span key={key} {...getTokenProps({ token })} />
+                                  ))}
+                                </span>
+                              </div>
+                            ))}
+                          </code>
+                        </pre>
+                      )}
+                    </Highlight>
                   </div>
                 )}
               </div>

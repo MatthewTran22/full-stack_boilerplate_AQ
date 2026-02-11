@@ -18,6 +18,8 @@ _clone_timestamps: dict[str, float] = {}  # clone_id -> creation time
 _MAX_CLONE_AGE_SECS = 3600
 # Max clones to keep in memory
 _MAX_CLONES = 50
+# Daytona hard limit on concurrent sandboxes
+DAYTONA_MAX_SANDBOXES = int(os.getenv("DAYTONA_MAX_SANDBOXES", "10"))
 
 
 def _evict_stale_clones():

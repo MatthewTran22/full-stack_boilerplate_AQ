@@ -235,6 +235,23 @@ def build_prompt(
         "- In page.tsx, import section components as: `import ComponentName from '@/components/ComponentName'`\n"
         "- Double-check: scan your JSX for any identifier starting with uppercase — each one MUST be imported.\n\n"
 
+        "## Project structure (already set up in sandbox — DO NOT regenerate these)\n"
+        "The sandbox already has a fully configured Next.js 14 project:\n"
+        "```\n"
+        "app/layout.tsx          ← root layout (Inter font, Tailwind globals) — DO NOT OUTPUT\n"
+        "app/globals.css         ← Tailwind @import + CSS variables — DO NOT OUTPUT\n"
+        "components/ui/*.tsx     ← shadcn/ui components (button, card, badge, etc.) — DO NOT OUTPUT\n"
+        "components/aceternity/* ← animated components (spotlight, beams, etc.) — DO NOT OUTPUT\n"
+        "lib/utils.ts            ← cn() helper — DO NOT OUTPUT\n"
+        "package.json            ← all deps installed (react, next, tailwindcss, lucide-react, etc.) — DO NOT OUTPUT\n"
+        "tsconfig.json           ← @/* path alias maps to project root — DO NOT OUTPUT\n"
+        "tailwind.config.ts      ← Tailwind config — DO NOT OUTPUT\n"
+        "```\n"
+        "You generate ONLY:\n"
+        "  - app/page.tsx (imports and assembles your section components)\n"
+        "  - components/<SectionName>.tsx (one per visual section: Navbar, Hero, Features, Footer, etc.)\n"
+        "All other project files already exist. NEVER output package.json, layout.tsx, globals.css, tsconfig, or any ui/* file.\n\n"
+
         "## Tech stack\n"
         "- React 18 + Next.js 14 App Router + Tailwind CSS\n"
         '- shadcn/ui: import from "@/components/ui/<name>" — available: button, card, badge, avatar, separator, accordion, tabs, input, textarea, navigation-menu, dialog, dropdown-menu, tooltip, select, checkbox, switch, progress, scroll-area, skeleton, table\n'
@@ -344,6 +361,96 @@ def _clean_code(content: str) -> str:
     # Ensure "use client" for TSX files
     if '"use client"' not in content and "'use client'" not in content:
         content = '"use client";\n' + content
+
+    # Auto-fix missing lucide-react imports
+    content = _fix_missing_imports(content)
+
+    return content
+
+
+def _fix_missing_imports(content: str) -> str:
+    """Auto-fix missing lucide-react and React imports in generated TSX."""
+    # Find all PascalCase JSX tags used: <Star />, <ChevronDown>, etc.
+    jsx_tags = set(re.findall(r'<([A-Z][a-zA-Z0-9]+)[\s/>]', content))
+
+    # Find all already-imported identifiers
+    imported = set()
+    for m in re.finditer(r'import\s+\{([^}]+)\}\s+from\s+[\'"]([^\'"]+)[\'"]', content):
+        names = [n.strip().split(' as ')[0].strip() for n in m.group(1).split(',')]
+        imported.update(names)
+    # Default imports
+    for m in re.finditer(r'import\s+(\w+)\s+from\s+[\'"]', content):
+        imported.add(m.group(1))
+
+    # Known lucide-react icons (common ones the AI uses)
+    lucide_icons = {
+        'Star', 'ChevronDown', 'ChevronUp', 'ChevronRight', 'ChevronLeft',
+        'Menu', 'X', 'Search', 'ArrowRight', 'ArrowLeft', 'ExternalLink',
+        'Check', 'Copy', 'Eye', 'EyeOff', 'Heart', 'ThumbsUp', 'Share2',
+        'Github', 'Twitter', 'Linkedin', 'Facebook', 'Instagram', 'Youtube',
+        'Mail', 'Phone', 'MapPin', 'Calendar', 'Clock', 'User', 'Users',
+        'Settings', 'Home', 'FileText', 'Folder', 'Download', 'Upload',
+        'Plus', 'Minus', 'Edit', 'Trash2', 'Shield', 'Lock', 'Unlock',
+        'Globe', 'Zap', 'Award', 'TrendingUp', 'BarChart', 'PieChart',
+        'Code', 'Terminal', 'GitBranch', 'GitCommit', 'GitPullRequest',
+        'GitMerge', 'GitFork', 'BookOpen', 'Book', 'Bookmark', 'Tag',
+        'Hash', 'AtSign', 'Bell', 'AlertCircle', 'AlertTriangle', 'Info',
+        'HelpCircle', 'MessageCircle', 'MessageSquare', 'Send', 'Paperclip',
+        'Image', 'Camera', 'Video', 'Music', 'Headphones', 'Mic', 'Volume2',
+        'Play', 'Pause', 'SkipForward', 'SkipBack', 'Repeat', 'Shuffle',
+        'Maximize2', 'Minimize2', 'MoreHorizontal', 'MoreVertical', 'Grid',
+        'List', 'Layout', 'Sidebar', 'Columns', 'Layers', 'Box', 'Package',
+        'Cpu', 'Database', 'Server', 'Cloud', 'Wifi', 'Bluetooth',
+        'Monitor', 'Smartphone', 'Tablet', 'Watch', 'Printer', 'Speaker',
+        'Sun', 'Moon', 'CloudRain', 'Wind', 'Droplet', 'Thermometer',
+        'Rocket', 'Sparkles', 'Flame', 'Target', 'Crosshair', 'Navigation',
+        'Compass', 'Map', 'Flag', 'Anchor', 'Briefcase', 'DollarSign',
+        'CreditCard', 'ShoppingCart', 'ShoppingBag', 'Gift', 'Percent',
+        'Activity', 'Aperture', 'Battery', 'BatteryCharging', 'Feather',
+        'Filter', 'Key', 'Link', 'Loader', 'LogIn', 'LogOut', 'Power',
+        'RefreshCw', 'RotateCw', 'Save', 'Scissors', 'Slash', 'Tool',
+        'Type', 'Underline', 'Bold', 'Italic', 'AlignLeft', 'AlignCenter',
+        'AlignRight', 'AlignJustify', 'CircleDot', 'Circle', 'Square',
+        'Triangle', 'Hexagon', 'Octagon', 'Pentagon', 'Diamond',
+        'FileCode', 'FileCode2', 'Files', 'FolderOpen', 'FolderGit2',
+        'ChevronDownIcon', 'StarIcon', 'CheckCircle', 'CheckCircle2',
+        'XCircle', 'MinusCircle', 'PlusCircle', 'ArrowUpRight',
+        'ArrowDownRight', 'MoveRight', 'Lightbulb', 'Wand2',
+    }
+
+    # Find missing lucide icons
+    missing_lucide = []
+    for tag in jsx_tags:
+        if tag not in imported and tag in lucide_icons:
+            missing_lucide.append(tag)
+
+    if not missing_lucide:
+        return content
+
+    missing_str = ', '.join(sorted(missing_lucide))
+    logger.warning(f"[ai] Auto-fixing missing lucide imports: {missing_str}")
+
+    # Check if there's an existing lucide-react import to extend
+    lucide_import_match = re.search(
+        r'(import\s+\{)([^}]+)(\}\s+from\s+[\'"]lucide-react[\'"];?)',
+        content,
+    )
+
+    if lucide_import_match:
+        existing = lucide_import_match.group(2).strip().rstrip(',')
+        new_imports = existing + ', ' + ', '.join(sorted(missing_lucide))
+        content = content[:lucide_import_match.start()] + \
+            lucide_import_match.group(1) + ' ' + new_imports + ' ' + lucide_import_match.group(3) + \
+            content[lucide_import_match.end():]
+    else:
+        # No existing lucide import — add one after "use client"
+        import_line = f'import {{ {", ".join(sorted(missing_lucide))} }} from "lucide-react";\n'
+        content = re.sub(
+            r'("use client";?\s*\n)',
+            r'\1' + import_line,
+            content,
+            count=1,
+        )
 
     return content
 
