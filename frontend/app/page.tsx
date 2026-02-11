@@ -85,9 +85,11 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [expandedScreenshot, setExpandedScreenshot] = useState<string | null>(null);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const [elapsed, setElapsed] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const logIdRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     getClones().then(setHistory).catch(() => {});
@@ -100,6 +102,24 @@ export default function Home() {
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logEntries]);
+
+  // Elapsed timer — runs while cloning is in progress
+  useEffect(() => {
+    if (status === "scraping" || status === "generating" || status === "deploying") {
+      if (!timerRef.current) {
+        setElapsed(0);
+        timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
+      }
+    } else {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [status]);
 
   const addMessageLog = (icon: MessageLogEntry["icon"], message: string, logStatus: MessageLogEntry["status"] = "active") => {
     const id = ++logIdRef.current;
@@ -487,7 +507,7 @@ export default function Home() {
               <div className="mt-4 pt-4 border-t border-border/50">
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-                  Working...
+                  Working... {elapsed > 0 && `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`}
                 </div>
               </div>
             )}

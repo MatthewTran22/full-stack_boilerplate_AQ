@@ -1,3 +1,4 @@
+import os
 import json
 import uuid
 import asyncio
@@ -17,7 +18,9 @@ from app.services.sandbox import (
     get_preview_files,
     get_sandbox_base_url,
     get_sandbox_logs,
+    release_clone,
     _preview_store,
+    _clone_timestamps,
 )
 from app.services.template_loader import get_template_files
 from app.database import save_clone, get_clones, get_clone
@@ -25,6 +28,15 @@ from app.database import save_clone, get_clones, get_clone
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ── Concurrency & rate limiting ──
+# Max simultaneous clone operations (each uses Playwright + AI + Daytona)
+MAX_CONCURRENT_CLONES = int(os.getenv("MAX_CONCURRENT_CLONES", "5"))
+_clone_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLONES)
+
+# Simple per-IP rate limiter: track last request time
+_rate_limit_map: dict[str, float] = {}
+RATE_LIMIT_SECONDS = 10  # Min seconds between clone requests per IP
 
 
 class CloneRequest(BaseModel):
@@ -36,11 +48,24 @@ def sse_event(data: dict) -> str:
 
 
 @router.post("/api/clone")
-async def clone_website(request: CloneRequest):
+async def clone_website(request: CloneRequest, raw_request: Request):
     """Clone a website: scrape, screenshot, generate Next.js files with AI, deploy to sandbox."""
     url = request.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # Rate limit per IP
+    client_ip = raw_request.client.host if raw_request.client else "unknown"
+    now = time.time()
+    last_request = _rate_limit_map.get(client_ip, 0)
+    if now - last_request < RATE_LIMIT_SECONDS:
+        raise HTTPException(status_code=429, detail="Please wait before starting another clone")
+    _rate_limit_map[client_ip] = now
+
+    # Check concurrency
+    if _clone_semaphore._value == 0:
+        logger.warning(f"[clone] Rejected request from {client_ip}: all {MAX_CONCURRENT_CLONES} slots busy")
+        raise HTTPException(status_code=503, detail=f"Server busy — {MAX_CONCURRENT_CLONES} clones already in progress. Try again shortly.")
 
     # Queue for status updates from both AI generator and sandbox setup
     status_queue: asyncio.Queue = asyncio.Queue()
@@ -51,9 +76,11 @@ async def clone_website(request: CloneRequest):
 
     async def event_stream():
         clone_id = str(uuid.uuid4())
+        logger.info(f"[clone:{clone_id}] Starting clone for {url} (slots={_clone_semaphore._value}/{MAX_CONCURRENT_CLONES})")
 
+        await _clone_semaphore.acquire()
         try:
-            # Step 1: Scrape the website (HTML + viewport screenshots + image URLs)
+            # Step 1: Scrape the website
             yield sse_event({"status": "scraping", "message": "Scraping website..."})
             t0 = time.time()
             try:
@@ -69,11 +96,14 @@ async def clone_website(request: CloneRequest):
                 scraped_interactives = scrape_result.get("interactives", [])
                 scraped_linked_pages = scrape_result.get("linked_pages", [])
             except Exception as e:
-                logger.error(f"Scraping failed: {e}")
+                logger.error(f"[clone:{clone_id}] Scraping failed for {url}: {e}")
                 yield sse_event({"status": "error", "message": f"Failed to scrape website: {e}"})
                 return
             t_scrape = time.time() - t0
-            logger.info(f"TIMING: Scrape took {t_scrape:.1f}s ({len(screenshots)} screenshots)")
+            logger.info(
+                f"[clone:{clone_id}] Scrape complete: {len(screenshots)} screenshots, "
+                f"{len(html_source)} chars HTML, {len(image_urls)} images ({t_scrape:.1f}s)"
+            )
 
             # Send first screenshot to frontend for verification
             yield sse_event({
@@ -98,7 +128,7 @@ async def clone_website(request: CloneRequest):
                         on_status=on_status,
                     )
                 except Exception as e:
-                    logger.warning(f"Sandbox setup failed: {e}")
+                    logger.error(f"[clone:{clone_id}] Sandbox setup failed: {e}")
                     return None
 
             sandbox_task = asyncio.create_task(_setup_sandbox())
@@ -120,12 +150,12 @@ async def clone_website(request: CloneRequest):
                     on_status=on_status,
                 )
             except Exception as e:
-                logger.error(f"AI generation failed: {e}")
+                logger.error(f"[clone:{clone_id}] AI generation failed: {e}")
                 sandbox_task.cancel()
                 yield sse_event({"status": "error", "message": str(e)})
                 return
             t_ai = time.time() - t1
-            logger.info(f"TIMING: AI generation took {t_ai:.1f}s")
+            logger.info(f"[clone:{clone_id}] AI generation complete: {len(files)} files ({t_ai:.1f}s)")
 
             if not files:
                 sandbox_task.cancel()
@@ -147,9 +177,9 @@ async def clone_website(request: CloneRequest):
             yield sse_event({"status": "deploying", "message": "Waiting for sandbox..."})
             t2 = time.time()
             sandbox_url = await sandbox_task
-            t_sandbox = time.time() - t1  # from when AI started (parallel)
+            t_sandbox = time.time() - t1
             t_sandbox_wait = time.time() - t2
-            logger.info(f"TIMING: Sandbox ready (waited {t_sandbox_wait:.1f}s after AI, total parallel time {t_sandbox:.1f}s)")
+            logger.info(f"[clone:{clone_id}] Sandbox ready (waited {t_sandbox_wait:.1f}s after AI, {t_sandbox:.1f}s total parallel)")
 
             # Step 3: Upload generated files AFTER sandbox is ready
             if sandbox_url:
@@ -170,11 +200,16 @@ async def clone_website(request: CloneRequest):
                 await asyncio.sleep(5)
 
                 logs = get_sandbox_logs(clone_id)
-                if logs:
-                    logger.info(f"Sandbox next.log (last 2000 chars):\n{logs[-2000:]}")
+                if logs and ("error" in logs.lower() or "Error" in logs):
+                    logger.warning(f"[clone:{clone_id}] Sandbox compile issues:\n{logs[-1000:]}")
 
             t_total = time.time() - t0
-            logger.info(f"TIMING TOTAL: {t_total:.1f}s (scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox waited={t_sandbox_wait:.1f}s after AI)")
+            total_lines = sum(f["content"].count("\n") + 1 for f in files)
+            logger.info(
+                f"[clone:{clone_id}] DONE: {t_total:.1f}s total "
+                f"(scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox_wait={t_sandbox_wait:.1f}s) "
+                f"| {len(files)} files, {total_lines} lines"
+            )
 
             # Step 5: Save to database
             _preview_store[clone_id] = files
@@ -195,16 +230,12 @@ async def clone_website(request: CloneRequest):
             if db_record and "id" in db_record:
                 old_clone_id = clone_id
                 clone_id = db_record["id"]
+                logger.info(f"[clone:{clone_id}] Remapped from temp ID {old_clone_id[:8]}...")
                 # Re-key all sandbox mappings to the DB-assigned ID
                 from app.services.sandbox import _sandbox_urls, _sandbox_instances, _sandbox_project_dirs
-                if old_clone_id in _sandbox_urls:
-                    _sandbox_urls[clone_id] = _sandbox_urls.pop(old_clone_id)
-                if old_clone_id in _sandbox_instances:
-                    _sandbox_instances[clone_id] = _sandbox_instances.pop(old_clone_id)
-                if old_clone_id in _sandbox_project_dirs:
-                    _sandbox_project_dirs[clone_id] = _sandbox_project_dirs.pop(old_clone_id)
-                if old_clone_id in _preview_store:
-                    _preview_store[clone_id] = _preview_store.pop(old_clone_id)
+                for store in [_sandbox_urls, _sandbox_instances, _sandbox_project_dirs, _preview_store, _clone_timestamps]:
+                    if old_clone_id in store:
+                        store[clone_id] = store.pop(old_clone_id)
                 _preview_store[clone_id] = files
                 if sandbox_url:
                     preview_url = f"/api/sandbox/{clone_id}/"
@@ -232,8 +263,11 @@ async def clone_website(request: CloneRequest):
         except HTTPException:
             raise
         except Exception as e:
-            logger.exception(f"Clone failed for {url}")
+            logger.exception(f"[clone:{clone_id}] Unhandled error for {url}")
             yield sse_event({"status": "error", "message": str(e)})
+        finally:
+            _clone_semaphore.release()
+            logger.info(f"[clone:{clone_id}] Released slot (slots={_clone_semaphore._value}/{MAX_CONCURRENT_CLONES})")
 
         yield "data: [DONE]\n\n"
 

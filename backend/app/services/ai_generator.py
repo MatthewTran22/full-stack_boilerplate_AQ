@@ -6,11 +6,17 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 
+_client: AsyncOpenAI | None = None
+
+
 def get_openrouter_client() -> AsyncOpenAI:
-    return AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.getenv("OPENROUTER_API_KEY", ""),
-    )
+    global _client
+    if _client is None:
+        _client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY", ""),
+        )
+    return _client
 
 
 def build_prompt(
@@ -30,6 +36,8 @@ def build_prompt(
     truncated_html = html[:max_html]
     if len(html) > max_html:
         truncated_html += "\n\n... [skeleton truncated] ..."
+        pct_kept = (max_html / len(html)) * 100
+        logger.info(f"[ai] HTML truncated: {len(html)} → {max_html} chars ({pct_kept:.0f}% kept)")
 
     image_list = "\n".join(f"  - {u}" for u in image_urls) if image_urls else "  (none extracted)"
 
@@ -177,62 +185,133 @@ def build_prompt(
         )
 
     return (
-        "You are a website cloning expert. Given the HTML source and a series of screenshots capturing "
-        f"the ENTIRE page (scrolled top to bottom in {n} viewport-sized chunks), "
-        "generate a Next.js page component (page.tsx) that visually replicates the ENTIRE page.\n\n"
-        "Tech stack available in the project:\n"
-        "- React 18 with Next.js 14 App Router\n"
-        "- Tailwind CSS for all styling\n"
-        "- shadcn/ui components — import from \"@/components/ui/<name>\"\n"
-        "  Available: button, card, badge, avatar, separator, accordion, tabs,\n"
-        "  input, textarea, navigation-menu, dialog, dropdown-menu,\n"
-        "  tooltip, select, checkbox, switch, progress,\n"
-        "  scroll-area, skeleton, table\n"
-        "- lucide-react icons — import { IconName } from \"lucide-react\"\n"
-        "- Aceternity UI animated components — import from \"@/components/aceternity/<name>\"\n"
-        "  Available: moving-border, background-beams, spotlight, text-generate-effect,\n"
-        "  typewriter-effect, card-hover-effect, lamp-effect, wavy-background,\n"
-        "  infinite-moving-cards, meteors, bento-grid, sparkles, tabs,\n"
-        "  tracing-beam, hero-highlight\n"
-        "  Use these for animated backgrounds, glowing borders, text effects, card hover animations, etc.\n"
-        "- Utility: import { cn } from \"@/lib/utils\"\n\n"
-        "Rules:\n"
-        "- CRITICAL: Output ONLY raw TSX code. No markdown fences (```), no explanation, no preamble, no commentary. "
-        "Your response must start with \"use client\" and contain NOTHING else but valid TSX code.\n"
-        '- The file MUST start with "use client" and export a default function component.\n'
-        "- Everything goes in ONE file (page.tsx). Define all sub-components in the same file.\n"
-        "- CRITICAL: The code must be valid TypeScript/JSX with no syntax errors. "
-        "Ensure all brackets, braces, and parentheses are properly closed. "
-        "In JSX, use {'<'} or {'>'} for literal angle brackets in text content. "
-        "Never put raw < or > in JSX text — they cause syntax errors.\n"
-        "- Use Tailwind CSS utility classes for layout, spacing, colors, typography.\n"
-        "- Use shadcn/ui components where they match the original UI (buttons, cards, nav menus, dialogs, badges, etc.).\n"
-        "- Use lucide-react for icons that match the original site.\n"
-        "- IMAGES: Use the original image URLs with regular <img> tags (NOT next/image). Here are the image URLs extracted:\n"
-        f"{image_list}\n"
-        "  Use these exact URLs. Match sizing and position from the screenshots.\n"
-        "  If an image URL is not listed, check the HTML source for it.\n"
-        "- LOGOS & SVGs: This is CRITICAL for visual accuracy. Reproduce all logos and brand icons exactly:\n"
-        "  1. If a logo is an <img>, use the original URL with an <img> tag.\n"
-        "  2. If a logo is an inline SVG, copy the SVG markup exactly as inline JSX (fix attributes: class→className, etc.).\n"
-        "  3. For other icons, use the closest lucide-react icon or reproduce the SVG inline.\n"
-        "  4. NEVER replace a logo with a text placeholder — always use the original image/SVG.\n"
-        "- FONTS: Use Tailwind font utilities. If Google Fonts are detected, load them with a <link> tag in a useEffect.\n"
-        "- You may use React hooks (useState, useEffect, useRef, etc.) for interactivity and animations.\n"
-        "- For animations, use Tailwind animate classes (animate-pulse, animate-bounce, etc.) or CSS transitions via className.\n"
-        "- IMPORTANT: Reproduce the ENTIRE page from top to bottom, including ALL sections visible across ALL screenshots. "
-        f"The {n} screenshots are sequential viewport captures from top to bottom — every section must appear in your output. "
-        "The page should scroll naturally just like the original.\n"
-        "- Match colors, spacing, font sizes, and layout as closely as possible to the screenshots.\n"
+        "You are a pixel-perfect website cloning machine. Your ONLY job is to produce an EXACT visual replica.\n"
+        f"You have {n} sequential viewport screenshots (top→bottom) and the HTML skeleton below.\n\n"
+
+        "## Output format — MULTI-FILE\n"
+        "- Output ONLY raw TSX code — no markdown fences, no explanation, no commentary.\n"
+        "- Split the output into MULTIPLE files using this delimiter format:\n"
+        "  // === FILE: <path> ===\n"
+        "  (code for that file)\n\n"
+        "- Required file structure:\n"
+        "  // === FILE: app/page.tsx ===          (main page — imports and assembles section components)\n"
+        "  // === FILE: components/Navbar.tsx ===  (navigation bar / header)\n"
+        "  // === FILE: components/Hero.tsx ===    (hero / above-the-fold section)\n"
+        "  // === FILE: components/Footer.tsx ===  (footer)\n"
+        "  ... plus additional component files for each major visual section (Features, Pricing, Testimonials, CTA, etc.)\n\n"
+        "- Rules for each file:\n"
+        '  - Every file starts with "use client" and exports a default function component.\n'
+        "  - Keep each component under ~300 lines. If a section is large, split it further.\n"
+        "  - app/page.tsx imports all section components and renders them in order.\n"
+        "  - Components import from @/components/ui/*, @/components/aceternity/*, lucide-react as needed.\n"
+        "  - Components that need shared state (e.g. mobile menu) can use useState locally.\n"
+        "- Must be valid TypeScript/JSX. Close all brackets. Use {'<'} or {'>'} for literal angle brackets in text.\n\n"
+
+        "## Coding structure — CRITICAL (follow exactly)\n"
+        "Each file MUST follow this exact structure in order:\n"
+        "```\n"
+        '"use client";\n'
+        "// 1. React imports (useState, useEffect, etc.)\n"
+        "import { useState } from 'react';\n"
+        "// 2. lucide-react icons — import EVERY icon you use (Star, ChevronDown, Menu, X, etc.)\n"
+        "import { Star, ChevronDown, Menu, X } from 'lucide-react';\n"
+        "// 3. UI component imports\n"
+        "import { Button } from '@/components/ui/button';\n"
+        "// 4. Section component imports (only in page.tsx)\n"
+        "import Navbar from '@/components/Navbar';\n"
+        "\n"
+        "// 5. Component function with default export\n"
+        "export default function ComponentName() {\n"
+        "  // 6. State declarations at the top\n"
+        "  const [isOpen, setIsOpen] = useState(false);\n"
+        "  // 7. Return JSX\n"
+        "  return (...);\n"
+        "}\n"
+        "```\n\n"
+        "IMPORT RULES (violations will crash the app):\n"
+        "- EVERY lucide-react icon used in JSX MUST be imported at the top. If you write <Star />, you MUST have `import { Star } from 'lucide-react'`.\n"
+        "- EVERY component used in JSX MUST be imported. If you write <Button>, you MUST import Button.\n"
+        "- NEVER use a variable, component, or icon that is not imported or declared in the same file.\n"
+        "- In page.tsx, import section components as: `import ComponentName from '@/components/ComponentName'`\n"
+        "- Double-check: scan your JSX for any identifier starting with uppercase — each one MUST be imported.\n\n"
+
+        "## Tech stack\n"
+        "- React 18 + Next.js 14 App Router + Tailwind CSS\n"
+        '- shadcn/ui: import from "@/components/ui/<name>" — available: button, card, badge, avatar, separator, accordion, tabs, input, textarea, navigation-menu, dialog, dropdown-menu, tooltip, select, checkbox, switch, progress, scroll-area, skeleton, table\n'
+        '- lucide-react: import { IconName } from "lucide-react"\n'
+        '- Aceternity UI: import from "@/components/aceternity/<name>" — available: moving-border, background-beams, spotlight, text-generate-effect, typewriter-effect, card-hover-effect, lamp-effect, wavy-background, infinite-moving-cards, meteors, bento-grid, sparkles, tabs, tracing-beam, hero-highlight\n'
+        '- import { cn } from "@/lib/utils"\n\n'
+
+        "## PIXEL-PERFECT RULES (these are the highest priority)\n\n"
+
+        "### 1. Exact text content\n"
+        "- Copy ALL text VERBATIM from the HTML skeleton — every heading, paragraph, button label, nav link, footer line.\n"
+        "- NEVER paraphrase, abbreviate, summarize, or use placeholder text like 'Lorem ipsum'.\n"
+        "- If the original says 'Get started for free' the clone must say exactly 'Get started for free', not 'Get Started' or 'Start Free'.\n\n"
+
+        "### 2. Exact colors\n"
+        "- Look at each section's background in the screenshots and reproduce the EXACT color.\n"
+        "- Use the hex colors from the extracted styles below — don't approximate.\n"
+        "- If a section has a dark background (#0a0a0a, #1a1a2e, etc.), use that exact value with bg-[#hex].\n"
+        "- If text is white-on-dark, use text-white. If it's gray on white, match the exact shade.\n"
+        "- Gradients must match: direction, start color, end color. Use bg-gradient-to-r/b/br with from-[#hex] via-[#hex] to-[#hex].\n\n"
+
+        "### 3. Exact spacing and dimensions\n"
+        "- Study the screenshots carefully for padding and margins between sections.\n"
+        "- Use specific Tailwind values: py-16, py-20, py-24, px-6, px-8, gap-6, gap-8, etc.\n"
+        "- Container max-widths: look at how wide the content area is relative to the viewport. Use max-w-7xl, max-w-6xl, max-w-5xl, etc.\n"
+        "- Section padding: most sections use py-16 to py-24. Match what you see.\n"
+        "- Card padding: usually p-6 to p-8. Match exactly.\n\n"
+
+        "### 4. Exact typography\n"
+        "- Match font sizes precisely: text-sm, text-base, text-lg, text-xl, text-2xl, text-3xl, text-4xl, text-5xl, text-6xl.\n"
+        "- Match font weights: font-normal, font-medium, font-semibold, font-bold, font-extrabold.\n"
+        "- Match line heights: leading-tight, leading-snug, leading-normal, leading-relaxed.\n"
+        "- Match letter spacing: tracking-tight, tracking-normal, tracking-wide.\n"
+        "- Headings are usually text-3xl to text-6xl font-bold. Body is text-base to text-lg.\n\n"
+
+        "### 5. Exact layout\n"
+        "- Count the columns in grids: 2-col, 3-col, 4-col. Use grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 etc.\n"
+        "- Match flex layouts: flex-row vs flex-col, items-center, justify-between, gap values.\n"
+        "- Match border radius: rounded-md, rounded-lg, rounded-xl, rounded-2xl, rounded-full.\n"
+        "- Match shadows: shadow-sm, shadow-md, shadow-lg, shadow-xl.\n"
+        "- Match borders: border, border-2, border color.\n\n"
+
+        "### 6. Exact images\n"
+        "- Use original image URLs with <img> tags (NOT next/image).\n"
+        "- Match image dimensions and aspect ratios from screenshots.\n"
+        "- Use object-cover/object-contain as appropriate.\n"
+        f"- Image URLs extracted:\n{image_list}\n"
+        "- If an image is in the HTML but not listed above, use it anyway.\n\n"
+
+        "### 7. Logos and SVGs\n"
+        "- If a logo is an <img>, use the original URL.\n"
+        "- If a logo is an inline SVG, copy the EXACT SVG markup as inline JSX (class→className, style string→object).\n"
+        "- NEVER replace a logo/SVG with text or a placeholder icon.\n\n"
+
+        "### 8. Fonts\n"
+        "- If Google Fonts are detected, load them in a useEffect with a <link> tag appended to document.head.\n"
+        "- Apply the font with style={{ fontFamily: 'Font Name, sans-serif' }} on the outer wrapper.\n\n"
+
+        "### 9. Completeness\n"
+        f"- There are {n} screenshots capturing the FULL page top to bottom. EVERY section must be in your output.\n"
+        "- Go through each screenshot one by one and make sure every visible section is reproduced.\n"
+        "- The page must scroll naturally like the original — same section order, same relative heights.\n"
+        "- Include the footer. Include sub-footers. Include every small detail.\n\n"
+
+        "### 10. Interactivity\n"
+        "- Use useState for any interactive elements (dropdowns, tabs, accordions, mobile menus).\n"
+        "- Hover states should work (use hover: Tailwind classes or onMouseEnter/onMouseLeave).\n"
+        "- Links should use <a> tags with the original URLs where possible.\n\n"
+
         f"{styles_section}"
         f"{logos_section}"
         f"{svgs_section}"
         f"{icons_section}"
         f"{interactives_section}"
         f"{linked_pages_section}\n"
-        "Here is the page structure skeleton (tags, classes, text, image placements — "
-        "full SVGs/logos/icons are provided in the sections above). "
-        "Use the SCREENSHOTS as the primary visual reference, and this skeleton for structure:\n\n"
+        "## HTML Skeleton\n"
+        "Use the screenshots as the PRIMARY visual reference. Use this skeleton for structure, text content, and image URLs:\n\n"
         f"{truncated_html}"
     )
 
@@ -332,7 +411,8 @@ async def generate_clone(
         logger.error("No screenshots provided — cannot generate clone")
         return []
 
-    logger.info(f"Generating clone with {n} viewport screenshots and {len(html)} chars of HTML")
+    prompt_len = len(html) + sum(len(u) for u in image_urls)
+    logger.info(f"[ai] Generating clone: {n} screenshots, {len(html)} chars HTML, {len(image_urls)} images, ~{prompt_len // 1000}k prompt chars")
 
     if on_status:
         await on_status("Analyzing page with AI...")
@@ -360,8 +440,10 @@ async def generate_clone(
     if on_status:
         await on_status(f"Sending {n} screenshots to AI for cloning...")
 
+    t_ai = __import__("time").time()
+    model = "anthropic/claude-sonnet-4.5"
     response = await client.chat.completions.create(
-        model="anthropic/claude-sonnet-4.5",
+        model=model,
         messages=[
             {"role": "user", "content": content},
         ],
@@ -370,21 +452,25 @@ async def generate_clone(
     )
 
     raw_output = response.choices[0].message.content or ""
-    logger.info(f"AI response: {len(raw_output)} chars")
+    t_elapsed = __import__("time").time() - t_ai
+    usage = getattr(response, "usage", None)
+    tokens_in = getattr(usage, "prompt_tokens", "?") if usage else "?"
+    tokens_out = getattr(usage, "completion_tokens", "?") if usage else "?"
+    logger.info(f"[ai] Response: {len(raw_output)} chars in {t_elapsed:.1f}s | model={model} tokens_in={tokens_in} tokens_out={tokens_out}")
 
     if not raw_output:
         return []
 
-    tsx_content = _clean_code(raw_output)
-    files = [{"path": "app/page.tsx", "content": tsx_content}]
+    files = parse_multi_file_output(raw_output)
 
     if on_status:
-        line_count = tsx_content.count("\n") + 1
-        await on_status({
-            "type": "file_write",
-            "file": "app/page.tsx",
-            "action": "create",
-            "lines": line_count,
-        })
+        for f in files:
+            line_count = f["content"].count("\n") + 1
+            await on_status({
+                "type": "file_write",
+                "file": f["path"],
+                "action": "create",
+                "lines": line_count,
+            })
 
     return files

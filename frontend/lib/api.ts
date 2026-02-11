@@ -28,6 +28,11 @@ export interface CloneEvent {
   screenshot?: string;
 }
 
+// 5 minute timeout for the entire SSE stream
+const STREAM_TIMEOUT_MS = 5 * 60 * 1000;
+// If no data received for 90s, consider the stream stalled
+const STALL_TIMEOUT_MS = 90 * 1000;
+
 export async function startClone(
   url: string,
   onProgress: (data: CloneEvent) => void
@@ -42,21 +47,41 @@ export async function startClone(
     const error = await response
       .json()
       .catch(() => ({ detail: "Clone request failed" }));
-    throw new Error(error.detail || "Clone request failed");
+    const detail = error.detail || "Clone request failed";
+    // Provide user-friendly messages for common errors
+    if (response.status === 422) throw new Error("Invalid URL format. Please check and try again.");
+    if (response.status === 429) throw new Error("Too many requests. Please wait a moment and try again.");
+    if (response.status >= 500) throw new Error("Server error — the backend may be restarting. Try again in a few seconds.");
+    throw new Error(detail);
   }
 
   if (!response.body) {
-    throw new Error("No response body");
+    throw new Error("No response body — connection may have been interrupted");
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let lastDataTime = Date.now();
+  const streamStart = Date.now();
 
   while (true) {
+    // Check overall timeout
+    if (Date.now() - streamStart > STREAM_TIMEOUT_MS) {
+      reader.cancel();
+      throw new Error("Clone timed out after 5 minutes. The site may be too complex — try a simpler page.");
+    }
+
+    // Check stall timeout
+    if (Date.now() - lastDataTime > STALL_TIMEOUT_MS) {
+      reader.cancel();
+      throw new Error("Connection stalled — no data received for 90s. Please try again.");
+    }
+
     const { done, value } = await reader.read();
     if (done) break;
 
+    lastDataTime = Date.now();
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
@@ -68,7 +93,7 @@ export async function startClone(
         try {
           onProgress(JSON.parse(data));
         } catch {
-          // skip malformed JSON
+          console.warn("[clone] Skipped malformed SSE data:", data.slice(0, 100));
         }
       }
     }
