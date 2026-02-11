@@ -21,6 +21,7 @@ from app.database import (
     save_clone,
     get_clones,
     get_clone,
+    upload_static_files,
     download_static_file,
     _guess_content_type,
 )
@@ -37,8 +38,23 @@ _clone_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLONES)
 _rate_limit_map: dict[str, float] = {}
 RATE_LIMIT_SECONDS = 10
 
-# Map clone_id → Daytona sandbox preview URL (for proxying)
-_sandbox_urls: dict[str, str] = {}
+# Map clone_id → (Daytona sandbox preview URL, creation timestamp)
+_sandbox_urls: dict[str, tuple[str, float]] = {}
+SANDBOX_MAX_AGE = 600  # 10 minutes — assume dead after this
+
+# Clones currently being re-created (to avoid duplicate sandbox creation)
+_recreating: set[str] = set()
+# Clones where re-creation permanently failed (no source files in storage)
+_recreation_failed: set[str] = set()
+
+LOADING_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3">
+<style>body{display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
+font-family:system-ui,sans-serif;background:#0a0a0a;color:#fff}
+.spinner{width:24px;height:24px;border:3px solid #333;border-top-color:#fff;
+border-radius:50%;animation:spin 0.8s linear infinite;margin-right:12px}
+@keyframes spin{to{transform:rotate(360deg)}}</style></head>
+<body><div class="spinner"></div>Rebuilding sandbox… this page will auto-refresh.</body></html>"""
 
 
 class CloneRequest(BaseModel):
@@ -203,9 +219,13 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 )
 
                 if dev_url:
-                    _sandbox_urls[clone_id] = dev_url
+                    _sandbox_urls[clone_id] = (dev_url, time.time())
                     preview_url = f"/api/sandbox/{clone_id}/"
                     logger.info(f"[clone:{clone_id}] Live preview proxied at {preview_url} → {dev_url}")
+
+                    # Persist source files to storage for sandbox re-creation later
+                    source_files = {f["path"]: f["content"].encode("utf-8") for f in files}
+                    upload_static_files(clone_id, source_files)
                 else:
                     logger.warning(f"[clone:{clone_id}] Dev server failed to start")
                     yield sse_event({"status": "error", "message": "Preview failed to start"})
@@ -321,16 +341,102 @@ async def serve_static(clone_id: str, path: str):
     return Response(content=data, media_type=content_type)
 
 
+async def _recreate_sandbox(clone_id: str) -> None:
+    """Recreate a Daytona sandbox from source files stored in Supabase Storage."""
+    if clone_id in _recreating:
+        return
+    _recreating.add(clone_id)
+
+    try:
+        from app.database import get_supabase, STORAGE_BUCKET
+        client = get_supabase()
+        if not client:
+            logger.error(f"[recreate:{clone_id}] No Supabase client")
+            return
+
+        # Download source files from storage
+        bucket = client.storage.from_(STORAGE_BUCKET)
+        source_files: list[dict] = []
+
+        def _list_recursive(prefix: str):
+            items = bucket.list(prefix)
+            for item in items:
+                name = item["name"] if isinstance(item, dict) else str(item)
+                full_path = f"{prefix}/{name}"
+                if "." in name:
+                    try:
+                        data = bucket.download(full_path)
+                        rel_path = full_path.replace(f"{clone_id}/", "", 1)
+                        source_files.append({"path": rel_path, "content": data.decode("utf-8")})
+                    except Exception:
+                        pass
+                else:
+                    _list_recursive(full_path)
+
+        _list_recursive(clone_id)
+
+        if not source_files:
+            logger.error(f"[recreate:{clone_id}] No source files found in storage")
+            _recreation_failed.add(clone_id)
+            return
+
+        logger.info(f"[recreate:{clone_id}] Downloaded {len(source_files)} source files, creating sandbox...")
+
+        # Create sandbox, upload template + source files, start dev server
+        all_template_files = get_template_files()
+        sandbox_ok = await setup_sandbox_shell(
+            template_files=all_template_files,
+            clone_id=clone_id,
+        )
+
+        if not sandbox_ok:
+            logger.error(f"[recreate:{clone_id}] Sandbox setup failed")
+            return
+
+        for f in source_files:
+            upload_file_to_sandbox(clone_id, f["path"], f["content"])
+
+        dev_url = await start_dev_server(clone_id=clone_id)
+        if dev_url:
+            _sandbox_urls[clone_id] = (dev_url, time.time())
+            logger.info(f"[recreate:{clone_id}] Sandbox recreated: {dev_url}")
+        else:
+            logger.error(f"[recreate:{clone_id}] Dev server failed to start")
+    except Exception as e:
+        logger.error(f"[recreate:{clone_id}] Recreation failed: {e}")
+    finally:
+        _recreating.discard(clone_id)
+
+
 @router.get("/api/sandbox/{clone_id}/{path:path}")
 async def proxy_sandbox(clone_id: str, path: str):
     """Reverse-proxy requests to the Daytona sandbox dev server.
 
-    Bypasses Daytona's preview warning interstitial.
+    If the sandbox is dead, triggers re-creation from stored source files
+    and returns a loading page that auto-refreshes.
     """
-    base_url = _sandbox_urls.get(clone_id)
-    if not base_url:
-        raise HTTPException(status_code=404, detail="Sandbox not found")
+    entry = _sandbox_urls.get(clone_id)
 
+    # If sandbox is stale (older than max age), treat as dead
+    if entry:
+        base_url, created_at = entry
+        if time.time() - created_at > SANDBOX_MAX_AGE:
+            logger.info(f"[proxy:{clone_id}] Sandbox stale ({int(time.time() - created_at)}s old), will recreate")
+            _sandbox_urls.pop(clone_id, None)
+            entry = None
+
+    # Sandbox not in memory or stale — trigger re-creation or show error
+    if not entry:
+        if clone_id in _recreation_failed:
+            return HTMLResponse(
+                content='<!DOCTYPE html><html><body style="display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-family:system-ui;background:#0a0a0a;color:#fff"><p>This clone has no saved source files and cannot be recreated.</p></body></html>',
+                status_code=404,
+            )
+        if clone_id not in _recreating:
+            asyncio.create_task(_recreate_sandbox(clone_id))
+        return HTMLResponse(content=LOADING_HTML)
+
+    base_url = entry[0]
     target = f"{base_url.rstrip('/')}/{path}"
     proxy_base = f"/api/sandbox/{clone_id}"
 
@@ -338,19 +444,28 @@ async def proxy_sandbox(clone_id: str, path: str):
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(target)
     except Exception as e:
-        logger.error(f"[proxy:{clone_id}] Failed to fetch {target}: {e}")
-        raise HTTPException(status_code=502, detail="Sandbox unreachable")
+        logger.warning(f"[proxy:{clone_id}] Sandbox unreachable, triggering re-creation: {e}")
+        _sandbox_urls.pop(clone_id, None)
+        if clone_id not in _recreating:
+            asyncio.create_task(_recreate_sandbox(clone_id))
+        return HTMLResponse(content=LOADING_HTML)
+
+    # If Daytona returns an error (sandbox deleted), trigger re-creation
+    if resp.status_code >= 400:
+        logger.warning(f"[proxy:{clone_id}] Sandbox returned {resp.status_code}, triggering re-creation")
+        _sandbox_urls.pop(clone_id, None)
+        if clone_id not in _recreating:
+            asyncio.create_task(_recreate_sandbox(clone_id))
+        return HTMLResponse(content=LOADING_HTML)
 
     content_type = resp.headers.get("content-type", "")
 
-    # Rewrite asset paths in HTML so they go through our proxy
     if "text/html" in content_type:
         body = resp.text
         body = body.replace('"/_next/', f'"{proxy_base}/_next/')
         body = body.replace("'/_next/", f"'{proxy_base}/_next/")
         return HTMLResponse(content=body, status_code=resp.status_code)
 
-    # Rewrite JS chunk loading paths
     if "javascript" in content_type:
         body = resp.text
         body = body.replace('"/_next/', f'"{proxy_base}/_next/')
