@@ -22,6 +22,8 @@ import {
   AlertCircle,
   FileCode2,
   ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
 
 type CloneStatus = "idle" | "scraping" | "generating" | "deploying" | "done" | "error";
@@ -80,6 +82,8 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<CloneHistoryItem[]>([]);
   const [copied, setCopied] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [expandedScreenshot, setExpandedScreenshot] = useState<string | null>(null);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -372,14 +376,30 @@ export default function Home() {
       </div>
 
       {/* Main workspace */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden relative">
         {/* Left: Activity log */}
-        <div className="w-80 shrink-0 border-r bg-card flex flex-col z-10">
-          <div className="px-4 py-3 border-b">
+        {!sidebarOpen && (
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="absolute left-2 top-14 z-20 p-1.5 rounded-lg bg-card border border-border shadow-sm hover:bg-secondary transition-colors"
+            title="Show activity"
+          >
+            <PanelLeftOpen className="w-4 h-4 text-muted-foreground" />
+          </button>
+        )}
+        <div className={`shrink-0 border-r bg-card flex flex-col z-10 transition-all duration-200 ${sidebarOpen ? "w-80" : "w-0 overflow-hidden border-r-0"}`}>
+          <div className="px-4 py-3 border-b flex items-center justify-between">
             <h2 className="text-sm font-semibold flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-primary" />
               Activity
             </h2>
+            <button
+              onClick={() => setSidebarOpen(false)}
+              className="p-1 rounded-md hover:bg-secondary transition-colors"
+              title="Hide activity"
+            >
+              <PanelLeftClose className="w-4 h-4 text-muted-foreground" />
+            </button>
           </div>
           <div className="flex-1 overflow-y-auto px-4 py-3">
             <div className="space-y-1">
@@ -393,7 +413,8 @@ export default function Home() {
                       <img
                         src={entry.src}
                         alt="Website screenshot"
-                        className="w-full rounded-md border border-border/50"
+                        className="w-full rounded-md border border-border/50 cursor-pointer hover:opacity-80 transition-opacity"
+                        onClick={() => setExpandedScreenshot(entry.src)}
                       />
                     </div>
                   );
@@ -596,6 +617,27 @@ export default function Home() {
           )}
         </div>
       </div>
+
+      {/* Screenshot lightbox */}
+      {expandedScreenshot && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm cursor-pointer"
+          onClick={() => setExpandedScreenshot(null)}
+        >
+          <button
+            onClick={() => setExpandedScreenshot(null)}
+            className="absolute top-4 right-4 p-2 rounded-full bg-white/10 hover:bg-white/20 transition-colors"
+          >
+            <X className="w-5 h-5 text-white" />
+          </button>
+          <img
+            src={expandedScreenshot}
+            alt="Screenshot expanded"
+            className="max-w-[90vw] max-h-[90vh] rounded-lg shadow-2xl object-contain"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      )}
     </main>
   );
 }

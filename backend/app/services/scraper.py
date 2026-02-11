@@ -275,6 +275,257 @@ EXTRACT_LOGO_IMAGES_JS = """
 """
 
 
+# JS to find clickable trigger elements and tag them for Playwright clicking
+FIND_TRIGGERS_JS = """
+() => {
+    const triggers = [];
+
+    // Semantic triggers — anything that smells interactive
+    const selectors = [
+        'button', '[role="button"]', '[role="tab"]', '[role="switch"]',
+        '[aria-expanded]', '[aria-haspopup]', 'summary',
+        '[data-toggle]', '[data-bs-toggle]',
+        'a[href="#"]', 'a[href=""]', 'a[aria-expanded]', 'a[aria-haspopup]',
+        'a[data-toggle]', 'a[data-bs-toggle]',
+    ];
+    const els = document.querySelectorAll(selectors.join(', '));
+
+    // Also cursor:pointer elements (custom clickables)
+    const allEls = document.querySelectorAll('div, span, li, label, a, figure, section, h1, h2, h3, h4, h5, h6, p, img');
+    const selectorSet = new Set([...els]);
+    const pointerEls = [];
+    for (const el of allEls) {
+        if (selectorSet.has(el)) continue;
+        const cs = getComputedStyle(el);
+        if (cs.cursor === 'pointer') {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 5 && rect.height > 5) {
+                // Skip if a parent is already in our set
+                let parentMatched = false;
+                let p = el.parentElement;
+                let depth = 0;
+                while (p && p !== document.body && depth < 5) {
+                    if (selectorSet.has(p)) { parentMatched = true; break; }
+                    p = p.parentElement;
+                    depth++;
+                }
+                if (!parentMatched) pointerEls.push(el);
+            }
+        }
+    }
+
+    const combined = [...els, ...pointerEls];
+
+    for (let i = 0; i < combined.length; i++) {
+        const el = combined[i];
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 2 && rect.height < 2) continue;
+
+        const tag = el.tagName.toLowerCase();
+        // Skip form submits and text inputs
+        if (tag === 'button' && el.getAttribute('type') === 'submit') continue;
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') continue;
+
+        const text = (el.textContent || '').trim().slice(0, 60);
+        const ariaLabel = el.getAttribute('aria-label') || '';
+        const label = ariaLabel || text || ('<' + tag + '>');
+
+        // Tag element so Playwright can find it
+        const tid = 'clonr-trigger-' + i;
+        el.setAttribute('data-clonr-trigger', tid);
+
+        triggers.push({
+            tid: tid,
+            tag: tag,
+            label: label,
+            href: (tag === 'a') ? (el.getAttribute('href') || '') : '',
+            role: el.getAttribute('role') || '',
+            ariaExpanded: el.getAttribute('aria-expanded'),
+            ariaHaspopup: el.getAttribute('aria-haspopup') || '',
+        });
+    }
+
+    return triggers.slice(0, 30);
+}
+"""
+
+# JS to snapshot all hidden/invisible elements on the page
+SNAPSHOT_HIDDEN_JS = """
+() => {
+    const hidden = {};
+    const all = document.querySelectorAll('*');
+    for (const el of all) {
+        if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'HEAD') continue;
+        const cs = getComputedStyle(el);
+        const isHidden = (
+            cs.display === 'none' ||
+            cs.visibility === 'hidden' ||
+            cs.opacity === '0' ||
+            (cs.maxHeight === '0px' && cs.overflow === 'hidden') ||
+            (cs.height === '0px' && cs.overflow === 'hidden') ||
+            el.getAttribute('aria-hidden') === 'true'
+        );
+        if (isHidden) {
+            // Use a stable identifier
+            const path = _getPath(el);
+            const text = (el.textContent || '').trim().slice(0, 120);
+            const tag = el.tagName.toLowerCase();
+            const cls = typeof el.className === 'string' ? el.className.slice(0, 80) : '';
+            hidden[path] = { tag, cls, text, path };
+        }
+    }
+
+    function _getPath(el) {
+        const parts = [];
+        let node = el;
+        while (node && node !== document.body && parts.length < 6) {
+            let id = node.tagName?.toLowerCase() || '?';
+            if (node.id) id += '#' + node.id;
+            else if (node.className && typeof node.className === 'string') {
+                const first = node.className.trim().split(/\\s+/)[0];
+                if (first) id += '.' + first;
+            }
+            parts.unshift(id);
+            node = node.parentElement;
+        }
+        return parts.join(' > ');
+    }
+
+    return hidden;
+}
+"""
+
+async def _detect_interactives(page) -> list[dict]:
+    """Click buttons on the page and observe what hidden elements become visible.
+
+    Returns a list of interaction relationships:
+    [{"trigger": "Features", "action": "hover", "revealed": [...]}]
+
+    For each trigger: tries hover first, then click. Uses DOM hidden-element
+    diffing to detect what changed. If a click navigates away, records the
+    destination URL and bounces back.
+    """
+    results = []
+    linked_pages: list[dict] = []
+    original_url = page.url
+
+    try:
+        triggers = await page.evaluate(FIND_TRIGGERS_JS)
+        if not triggers:
+            return {"toggles": [], "linked_pages": []}
+
+        logger.info(f"Found {len(triggers)} trigger candidates to interact with")
+
+        async def _bounce_back():
+            await page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(1000)
+            await page.evaluate(FIND_TRIGGERS_JS)
+
+        def _diff_hidden(before: dict, after: dict) -> tuple[list[dict], list[dict]]:
+            revealed = [info for path, info in before.items() if path not in after]
+            newly_hidden = [info for path, info in after.items() if path not in before]
+            return revealed, newly_hidden
+
+        def _build_entry(trigger: dict, action: str, revealed: list, newly_hidden: list) -> dict:
+            entry = {
+                "trigger": trigger["label"],
+                "triggerTag": trigger["tag"],
+                "triggerRole": trigger.get("role", ""),
+                "action": action,
+            }
+            if revealed:
+                entry["revealed"] = [
+                    {"tag": r["tag"], "cls": r["cls"], "text": r["text"][:100]}
+                    for r in revealed[:5]
+                ]
+            if newly_hidden:
+                entry["hid"] = [
+                    {"tag": h["tag"], "cls": h["cls"], "text": h["text"][:60]}
+                    for h in newly_hidden[:3]
+                ]
+            return entry
+
+        for trigger in triggers:
+            tid = trigger["tid"]
+            selector = f'[data-clonr-trigger="{tid}"]'
+
+            try:
+                if page.url != original_url:
+                    logger.info(f"Bouncing back from {page.url}")
+                    await _bounce_back()
+
+                el = page.locator(selector)
+                if await el.count() == 0:
+                    continue
+
+                await el.scroll_into_view_if_needed(timeout=2000)
+
+                # --- HOVER first ---
+                hidden_before = await page.evaluate(SNAPSHOT_HIDDEN_JS)
+
+                await el.hover(timeout=2000)
+                await page.wait_for_timeout(350)
+
+                hidden_after_hover = await page.evaluate(SNAPSHOT_HIDDEN_JS)
+                hover_revealed, hover_hidden = _diff_hidden(hidden_before, hidden_after_hover)
+
+                if hover_revealed or hover_hidden:
+                    results.append(_build_entry(trigger, "hover", hover_revealed, hover_hidden))
+                    logger.info(
+                        f"Hover '{trigger['label'][:30]}': "
+                        f"revealed {len(hover_revealed)}, hid {len(hover_hidden)}"
+                    )
+                    await page.mouse.move(0, 0)
+                    await page.wait_for_timeout(250)
+                    continue
+
+                # --- CLICK (hover didn't reveal anything) ---
+                hidden_before = await page.evaluate(SNAPSHOT_HIDDEN_JS)
+
+                await el.click(timeout=2000, no_wait_after=True)
+                await page.wait_for_timeout(400)
+
+                if page.url != original_url:
+                    nav_url = page.url
+                    logger.info(f"Click '{trigger['label'][:30]}' navigated to {nav_url}")
+                    linked_pages.append({
+                        "trigger": trigger["label"],
+                        "url": nav_url,
+                    })
+                    await _bounce_back()
+                    continue
+
+                hidden_after_click = await page.evaluate(SNAPSHOT_HIDDEN_JS)
+                click_revealed, click_hidden = _diff_hidden(hidden_before, hidden_after_click)
+
+                if click_revealed or click_hidden:
+                    results.append(_build_entry(trigger, "click", click_revealed, click_hidden))
+                    logger.info(
+                        f"Click '{trigger['label'][:30]}': "
+                        f"revealed {len(click_revealed)}, hid {len(click_hidden)}"
+                    )
+
+                # Click again to restore state
+                try:
+                    await el.click(timeout=1000, no_wait_after=True)
+                    await page.wait_for_timeout(200)
+                except Exception:
+                    pass
+
+            except Exception as e:
+                logger.debug(f"Trigger '{trigger['label'][:30]}' failed: {e}")
+                continue
+
+    except Exception as e:
+        logger.warning(f"Interactive detection failed: {e}")
+
+    if linked_pages:
+        logger.info(f"Discovered {len(linked_pages)} linked pages: {[lp['url'] for lp in linked_pages]}")
+
+    logger.info(f"Detected {len(results)} interactions ({sum(1 for r in results if r.get('action') == 'hover')} hover, {sum(1 for r in results if r.get('action') == 'click')} click)")
+    return {"toggles": results, "linked_pages": linked_pages}
+
+
 async def scrape_and_capture(url: str) -> dict:
     """
     Full Playwright scrape: HTML, viewport screenshots, image URLs,
@@ -324,7 +575,7 @@ async def scrape_and_capture(url: str) -> dict:
             logger.warning(f"Logo extraction failed: {e}")
             logos = []
 
-        # Get total page height
+        # Get total page height (before clicking, which might change layout)
         total_height = await page.evaluate("document.body.scrollHeight")
 
         # Take viewport-sized screenshots scrolling top to bottom (capped)
@@ -339,6 +590,14 @@ async def scrape_and_capture(url: str) -> dict:
         if total_height > VIEWPORT_HEIGHT * MAX_SCREENSHOTS:
             logger.info(f"Capped at {MAX_SCREENSHOTS} screenshots (page height: {total_height}px)")
 
+        # Detect interactive toggle relationships by clicking buttons
+        # Done AFTER screenshots so clicks don't affect the visual captures
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(300)
+        interactive_result = await _detect_interactives(page)
+        interactives = interactive_result["toggles"]
+        linked_pages = interactive_result["linked_pages"]
+
         await browser.close()
 
     # Parse HTML for image URLs
@@ -352,7 +611,8 @@ async def scrape_and_capture(url: str) -> dict:
     logger.info(
         f"Scraped {url}: {len(screenshots_b64)} screenshots, {len(image_urls)} images, "
         f"{len(svgs)} SVGs ({logo_svgs} logos), {len(logos)} logo images, "
-        f"{len(styles.get('fonts', []))} fonts"
+        f"{len(styles.get('fonts', []))} fonts, {len(interactives)} toggles, "
+        f"{len(linked_pages)} linked pages"
     )
 
     return {
@@ -364,6 +624,8 @@ async def scrape_and_capture(url: str) -> dict:
         "icons": icons,
         "svgs": svgs,
         "logos": logos,
+        "interactives": interactives,
+        "linked_pages": linked_pages,
     }
 
 

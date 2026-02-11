@@ -22,6 +22,8 @@ def build_prompt(
     icons: dict | None = None,
     svgs: list[dict] | None = None,
     logos: list[dict] | None = None,
+    interactives: list[dict] | None = None,
+    linked_pages: list[dict] | None = None,
 ) -> str:
     """Build the clone prompt with HTML, image URLs, styles, icons, SVGs, logos."""
     max_html = 30000
@@ -120,6 +122,60 @@ def build_prompt(
                 + "\n".join(f"- {p}" for p in icon_parts) + "\n"
             )
 
+    # Build interactive relationships section (hover + click)
+    interactives_section = ""
+    if interactives:
+        parts = []
+        for rel in interactives:
+            trigger_label = rel.get("trigger", "?")
+            trigger_tag = rel.get("triggerTag", "?")
+            action = rel.get("action", "click")
+
+            line = f'  - {action.upper()} "{trigger_label}" (<{trigger_tag}>)'
+
+            if rel.get("revealed"):
+                revealed_descs = []
+                for r in rel["revealed"]:
+                    desc = f'<{r["tag"]}'
+                    if r.get("cls"):
+                        desc += f' class="{r["cls"][:50]}"'
+                    desc += ">"
+                    if r.get("text"):
+                        desc += f' "{r["text"][:60]}"'
+                    revealed_descs.append(desc)
+                line += " → REVEALS: " + "; ".join(revealed_descs)
+
+            if rel.get("hid"):
+                hid_descs = [f'<{h["tag"]}> "{h.get("text", "")[:40]}"' for h in rel["hid"]]
+                line += " → HIDES: " + "; ".join(hid_descs)
+
+            parts.append(line)
+
+        interactives_section = (
+            "\n\nINTERACTIONS detected by hovering and clicking elements on the live page:\n"
+            + "(We tested each element with hover first, then click, and recorded what changed)\n"
+            + "\n".join(parts)
+            + "\n\nCRITICAL interactivity rules:\n"
+            + "- Each interaction above MUST be functional in the clone.\n"
+            + "- HOVER interactions: use onMouseEnter/onMouseLeave with useState to show/hide content.\n"
+            + "- CLICK interactions: use onClick with useState to toggle content.\n"
+            + "- Dropdowns/menus: match the original trigger (hover or click). Show/hide the content.\n"
+            + "- Tabs: use useState to track the active tab. Render different content per tab.\n"
+            + "- Accordions: use useState to toggle sections open/closed.\n"
+            + "- Tooltips: use onMouseEnter/onMouseLeave to show/hide.\n"
+            + "- ALL interactive elements must actually work — not just be static.\n"
+        )
+
+    # Build linked pages section (pages discovered when buttons navigated away)
+    linked_pages_section = ""
+    if linked_pages:
+        page_lines = [f'  - "{lp["trigger"]}" links to: {lp["url"]}' for lp in linked_pages[:10]]
+        linked_pages_section = (
+            "\n\nLINKED PAGES discovered (buttons that navigate to other pages):\n"
+            + "\n".join(page_lines)
+            + "\n- For these, use <a> tags with the original URLs so they work as navigation links.\n"
+        )
+
     return (
         "You are a website cloning expert. Given the HTML source and a series of screenshots capturing "
         f"the ENTIRE page (scrolled top to bottom in {n} viewport-sized chunks), "
@@ -171,7 +227,9 @@ def build_prompt(
         f"{styles_section}"
         f"{logos_section}"
         f"{svgs_section}"
-        f"{icons_section}\n"
+        f"{icons_section}"
+        f"{interactives_section}"
+        f"{linked_pages_section}\n"
         "Here is the page structure skeleton (tags, classes, text, image placements — "
         "full SVGs/logos/icons are provided in the sections above). "
         "Use the SCREENSHOTS as the primary visual reference, and this skeleton for structure:\n\n"
@@ -259,6 +317,8 @@ async def generate_clone(
     icons: dict | None = None,
     svgs: list[dict] | None = None,
     logos: list[dict] | None = None,
+    interactives: list[dict] | None = None,
+    linked_pages: list[dict] | None = None,
     on_status=None,
 ) -> list[dict]:
     """Generate a Next.js clone from HTML + viewport screenshots.
@@ -281,6 +341,8 @@ async def generate_clone(
         html, image_urls, n,
         styles=styles, font_links=font_links,
         icons=icons, svgs=svgs, logos=logos,
+        interactives=interactives,
+        linked_pages=linked_pages,
     )
 
     content: list = []

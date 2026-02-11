@@ -6,6 +6,7 @@ httpx
 beautifulsoup4
 playwright
 Pillow
+numpy
 openai
 supabase
 daytona-sdk

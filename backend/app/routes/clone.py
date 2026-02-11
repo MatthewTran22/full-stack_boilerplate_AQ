@@ -66,6 +66,8 @@ async def clone_website(request: CloneRequest):
                 scraped_icons = scrape_result.get("icons")
                 scraped_svgs = scrape_result.get("svgs", [])
                 scraped_logos = scrape_result.get("logos", [])
+                scraped_interactives = scrape_result.get("interactives", [])
+                scraped_linked_pages = scrape_result.get("linked_pages", [])
             except Exception as e:
                 logger.error(f"Scraping failed: {e}")
                 yield sse_event({"status": "error", "message": f"Failed to scrape website: {e}"})
@@ -80,10 +82,28 @@ async def clone_website(request: CloneRequest):
                 "screenshot": screenshots[0] if screenshots else "",
             })
 
-            # Step 2: Generate code with AI FIRST
+            # Step 2: AI generation + sandbox setup IN PARALLEL
             yield sse_event({"status": "generating", "message": "AI is generating the clone..."})
             t1 = time.time()
 
+            # Start sandbox setup immediately (don't wait for AI)
+            # Upload ALL template files — we'll add the generated code after
+            all_template_files = get_template_files()
+
+            async def _setup_sandbox():
+                try:
+                    return await setup_sandbox_shell(
+                        template_files=all_template_files,
+                        clone_id=clone_id,
+                        on_status=on_status,
+                    )
+                except Exception as e:
+                    logger.warning(f"Sandbox setup failed: {e}")
+                    return None
+
+            sandbox_task = asyncio.create_task(_setup_sandbox())
+
+            # Run AI generation concurrently
             try:
                 files = await generate_clone(
                     html=html_source,
@@ -95,16 +115,20 @@ async def clone_website(request: CloneRequest):
                     icons=scraped_icons,
                     svgs=scraped_svgs,
                     logos=scraped_logos,
+                    interactives=scraped_interactives,
+                    linked_pages=scraped_linked_pages,
                     on_status=on_status,
                 )
             except Exception as e:
                 logger.error(f"AI generation failed: {e}")
+                sandbox_task.cancel()
                 yield sse_event({"status": "error", "message": str(e)})
                 return
             t_ai = time.time() - t1
             logger.info(f"TIMING: AI generation took {t_ai:.1f}s")
 
             if not files:
+                sandbox_task.cancel()
                 yield sse_event({"status": "error", "message": "AI returned no files"})
                 return
 
@@ -119,59 +143,15 @@ async def clone_website(request: CloneRequest):
                     "lines": line_count,
                 })
 
-            # Step 3: Set up sandbox with template + generated code
-            # Scan ALL generated files for component imports
-            all_code = "\n".join(f["content"] for f in files)
-            used = get_used_components(all_code)
-            used_ui = used["ui"]
-            used_aceternity = used["aceternity"]
-            logger.info(f"shadcn components used: {used_ui or 'none'}")
-            logger.info(f"aceternity components used: {used_aceternity or 'none'}")
-
-            all_template_files = get_template_files()
-
-            # Filter: keep everything except unused component library files
-            template_files = []
-            for tf in all_template_files:
-                if tf["path"].startswith("components/ui/"):
-                    comp_name = tf["path"].replace("components/ui/", "").replace(".tsx", "")
-                    if comp_name in used_ui:
-                        template_files.append(tf)
-                        logger.info(f"Including shadcn: {comp_name}")
-                elif tf["path"].startswith("components/aceternity/"):
-                    comp_name = tf["path"].replace("components/aceternity/", "").replace(".tsx", "")
-                    if comp_name in used_aceternity:
-                        template_files.append(tf)
-                        logger.info(f"Including aceternity: {comp_name}")
-                else:
-                    template_files.append(tf)
-
-            # Always include lib/utils.ts if any components are used
-            if used_ui or used_aceternity:
-                has_utils = any(tf["path"] == "lib/utils.ts" for tf in template_files)
-                if not has_utils:
-                    for tf in all_template_files:
-                        if tf["path"] == "lib/utils.ts":
-                            template_files.append(tf)
-                            break
-
-            total_components = len(used_ui) + len(used_aceternity)
-            yield sse_event({"status": "deploying", "message": f"Setting up sandbox ({total_components} UI components)..."})
-            sandbox_url = None
+            # Wait for sandbox to be ready (may already be done)
+            yield sse_event({"status": "deploying", "message": "Waiting for sandbox..."})
             t2 = time.time()
+            sandbox_url = await sandbox_task
+            t_sandbox = time.time() - t1  # from when AI started (parallel)
+            t_sandbox_wait = time.time() - t2
+            logger.info(f"TIMING: Sandbox ready (waited {t_sandbox_wait:.1f}s after AI, total parallel time {t_sandbox:.1f}s)")
 
-            try:
-                sandbox_url = await setup_sandbox_shell(
-                    template_files=template_files,
-                    clone_id=clone_id,
-                    on_status=on_status,
-                )
-            except Exception as e:
-                logger.warning(f"Sandbox setup failed: {e}")
-            t_sandbox = time.time() - t2
-            logger.info(f"TIMING: Sandbox setup took {t_sandbox:.1f}s")
-
-            # Step 4: Upload generated files AFTER sandbox is ready
+            # Step 3: Upload generated files AFTER sandbox is ready
             if sandbox_url:
                 yield sse_event({"status": "deploying", "message": "Uploading generated code..."})
 
@@ -194,7 +174,7 @@ async def clone_website(request: CloneRequest):
                     logger.info(f"Sandbox next.log (last 2000 chars):\n{logs[-2000:]}")
 
             t_total = time.time() - t0
-            logger.info(f"TIMING TOTAL: {t_total:.1f}s (scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox={t_sandbox:.1f}s)")
+            logger.info(f"TIMING TOTAL: {t_total:.1f}s (scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox waited={t_sandbox_wait:.1f}s after AI)")
 
             # Step 5: Save to database
             _preview_store[clone_id] = files
