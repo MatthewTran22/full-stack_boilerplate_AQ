@@ -1,0 +1,113 @@
+{
+  "button": {
+    "name": "Button",
+    "description": "Displays a button or a component that looks like a button.",
+    "usage": "<Button variant=\"default\" size=\"default\">Click me</Button>",
+    "variants": ["default", "destructive", "outline", "secondary", "ghost", "link"],
+    "sizes": ["default", "sm", "lg", "icon"],
+    "html_pattern": "<button class=\"inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4 py-2\">Button</button>",
+    "variant_classes": {
+      "default": "bg-primary text-primary-foreground hover:bg-primary/90",
+      "destructive": "bg-destructive text-destructive-foreground hover:bg-destructive/90",
+      "outline": "border border-input bg-background hover:bg-accent hover:text-accent-foreground",
+      "secondary": "bg-secondary text-secondary-foreground hover:bg-secondary/80",
+      "ghost": "hover:bg-accent hover:text-accent-foreground",
+      "link": "text-primary underline-offset-4 hover:underline"
+    }
+  },
+  "card": {
+    "name": "Card",
+    "description": "Displays a card with header, content, and footer.",
+    "usage": "<Card><CardHeader><CardTitle>Title</CardTitle><CardDescription>Description</CardDescription></CardHeader><CardContent>Content</CardContent><CardFooter>Footer</CardFooter></Card>",
+    "html_pattern": "<div class=\"rounded-lg border bg-card text-card-foreground shadow-sm\"><div class=\"flex flex-col space-y-1.5 p-6\"><h3 class=\"text-2xl font-semibold leading-none tracking-tight\">Title</h3><p class=\"text-sm text-muted-foreground\">Description</p></div><div class=\"p-6 pt-0\">Content</div><div class=\"flex items-center p-6 pt-0\">Footer</div></div>"
+  },
+  "input": {
+    "name": "Input",
+    "description": "Displays a form input field.",
+    "usage": "<Input type=\"text\" placeholder=\"Enter text...\" />",
+    "html_pattern": "<input class=\"flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50\" type=\"text\" placeholder=\"Enter text...\" />"
+  },
+  "badge": {
+    "name": "Badge",
+    "description": "Displays a badge.",
+    "usage": "<Badge variant=\"default\">Badge</Badge>",
+    "variants": ["default", "secondary", "destructive", "outline"],
+    "html_pattern": "<div class=\"inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 border-transparent bg-primary text-primary-foreground hover:bg-primary/80\">Badge</div>",
+    "variant_classes": {
+      "default": "border-transparent bg-primary text-primary-foreground hover:bg-primary/80",
+      "secondary": "border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80",
+      "destructive": "border-transparent bg-destructive text-destructive-foreground hover:bg-destructive/80",
+      "outline": "text-foreground"
+    }
+  },
+  "avatar": {
+    "name": "Avatar",
+    "description": "An image element with a fallback for representing the user.",
+    "html_pattern": "<span class=\"relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full\"><img class=\"aspect-square h-full w-full\" src=\"https://placehold.co/40x40\" alt=\"Avatar\" /><span class=\"flex h-full w-full items-center justify-center rounded-full bg-muted\">CN</span></span>"
+  },
+  "separator": {
+    "name": "Separator",
+    "description": "Visually or semantically separates content.",
+    "html_pattern": "<div class=\"shrink-0 bg-border h-[1px] w-full\"></div>"
+  },
+  "skeleton": {
+    "name": "Skeleton",
+    "description": "Used to show a placeholder while content is loading.",
+    "html_pattern": "<div class=\"animate-pulse rounded-md bg-muted h-4 w-full\"></div>"
+  },
+  "alert": {
+    "name": "Alert",
+    "description": "Displays a callout for important information.",
+    "html_pattern": "<div class=\"relative w-full rounded-lg border p-4\"><h5 class=\"mb-1 font-medium leading-none tracking-tight\">Alert Title</h5><div class=\"text-sm text-muted-foreground\">Alert description goes here.</div></div>"
+  },
+  "table": {
+    "name": "Table",
+    "description": "A responsive table component.",
+    "html_pattern": "<div class=\"relative w-full overflow-auto\"><table class=\"w-full caption-bottom text-sm\"><thead class=\"[&_tr]:border-b\"><tr class=\"border-b transition-colors hover:bg-muted/50\"><th class=\"h-12 px-4 text-left align-middle font-medium text-muted-foreground\">Header</th></tr></thead><tbody class=\"[&_tr:last-child]:border-0\"><tr class=\"border-b transition-colors hover:bg-muted/50\"><td class=\"p-4 align-middle\">Cell</td></tr></tbody></table></div>"
+  },
+  "tabs": {
+    "name": "Tabs",
+    "description": "A set of layered sections of content known as tab panels.",
+    "html_pattern": "<div><div class=\"inline-flex h-10 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground\"><button class=\"inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1.5 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 bg-background text-foreground shadow-sm\">Tab 1</button><button class=\"inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1.5 text-sm font-medium\">Tab 2</button></div><div class=\"mt-2 p-4\">Tab content</div></div>"
+  },
+  "dialog": {
+    "name": "Dialog",
+    "description": "A modal dialog that interrupts the user.",
+    "html_pattern": "<div class=\"fixed inset-0 z-50 bg-black/80\"></div><div class=\"fixed left-[50%] top-[50%] z-50 w-full max-w-lg translate-x-[-50%] translate-y-[-50%] border bg-background p-6 shadow-lg rounded-lg\"><div class=\"flex flex-col space-y-1.5 text-center sm:text-left\"><h2 class=\"text-lg font-semibold leading-none tracking-tight\">Dialog Title</h2><p class=\"text-sm text-muted-foreground\">Dialog description</p></div><div class=\"mt-4\">Content</div></div>"
+  },
+  "dropdown_menu": {
+    "name": "Dropdown Menu",
+    "description": "Displays a menu to the user triggered by a button.",
+    "html_pattern": "<div class=\"relative\"><button class=\"inline-flex items-center justify-center rounded-md text-sm font-medium h-10 px-4 py-2 border border-input bg-background hover:bg-accent\">Open</button><div class=\"z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md\"><div class=\"relative flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none hover:bg-accent hover:text-accent-foreground\">Menu Item</div></div></div>"
+  },
+  "navigation_menu": {
+    "name": "Navigation Menu",
+    "description": "A navigation menu component for site navigation.",
+    "html_pattern": "<nav class=\"relative z-10 flex max-w-max flex-1 items-center justify-center\"><div class=\"flex flex-1 items-center justify-center space-x-2\"><a class=\"group inline-flex h-10 w-max items-center justify-center rounded-md bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground\" href=\"#\">Link 1</a><a class=\"group inline-flex h-10 w-max items-center justify-center rounded-md bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground\" href=\"#\">Link 2</a></div></nav>"
+  },
+  "toast": {
+    "name": "Toast",
+    "description": "A succinct message that is displayed temporarily.",
+    "html_pattern": "<div class=\"fixed bottom-4 right-4 z-50\"><div class=\"group pointer-events-auto relative flex w-full items-center justify-between space-x-4 overflow-hidden rounded-md border p-6 pr-8 shadow-lg bg-background text-foreground\"><div class=\"grid gap-1\"><div class=\"text-sm font-semibold\">Toast Title</div><div class=\"text-sm opacity-90\">Toast description</div></div></div></div>"
+  },
+  "select": {
+    "name": "Select",
+    "description": "Displays a list of options for the user to pick from.",
+    "html_pattern": "<button class=\"flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2\"><span>Select option...</span><svg class=\"h-4 w-4 opacity-50\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"m6 9 6 6 6-6\"/></svg></button>"
+  },
+  "textarea": {
+    "name": "Textarea",
+    "description": "Displays a textarea form field.",
+    "html_pattern": "<textarea class=\"flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50\" placeholder=\"Type here...\"></textarea>"
+  },
+  "switch": {
+    "name": "Switch",
+    "description": "A toggle switch control.",
+    "html_pattern": "<button class=\"peer inline-flex h-[24px] w-[44px] shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors bg-input\" role=\"switch\"><span class=\"pointer-events-none block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform translate-x-0\"></span></button>"
+  },
+  "progress": {
+    "name": "Progress",
+    "description": "Displays a progress bar indicating completion.",
+    "html_pattern": "<div class=\"relative h-4 w-full overflow-hidden rounded-full bg-secondary\"><div class=\"h-full w-1/2 flex-1 bg-primary transition-all rounded-full\"></div></div>"
+  }
+}

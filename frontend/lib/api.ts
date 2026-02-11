@@ -7,15 +7,30 @@ export interface CloneHistoryItem {
   created_at: string;
 }
 
+export interface CloneFile {
+  path: string;
+  content: string;
+  lines: number;
+}
+
+export interface CloneEvent {
+  status: string;
+  message?: string;
+  preview_url?: string;
+  clone_id?: string;
+  files?: CloneFile[];
+  // file_write event fields
+  type?: string;
+  file?: string;
+  action?: string;
+  lines?: number;
+  // screenshot event
+  screenshot?: string;
+}
+
 export async function startClone(
   url: string,
-  onProgress: (data: {
-    status: string;
-    message: string;
-    html?: string;
-    preview_url?: string;
-    clone_id?: string;
-  }) => void
+  onProgress: (data: CloneEvent) => void
 ): Promise<void> {
   const response = await fetch(`${API_URL}/api/clone`, {
     method: "POST",
@@ -68,4 +83,11 @@ export async function getClones(): Promise<CloneHistoryItem[]> {
 
 export function getPreviewUrl(cloneId: string): string {
   return `${API_URL}/api/preview/${cloneId}`;
+}
+
+export function resolveApiUrl(path: string): string {
+  // If it's already a full URL, return as-is
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  // Relative path from backend — prepend API_URL
+  return `${API_URL}${path}`;
 }
