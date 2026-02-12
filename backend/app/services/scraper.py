@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 MAX_SCREENSHOT_DIM = 7000
 VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 720
-MAX_SCREENSHOTS = 8  # Cap screenshots for parallel AI agents; evenly spaced for tall pages
+MAX_SCREENSHOTS = 12  # Cap screenshots for parallel AI agents; ensures stride ≤ viewport for pages up to ~8640px
 
 
 # JS to extract computed styles, fonts, colors from the live page

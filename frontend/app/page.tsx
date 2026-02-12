@@ -34,6 +34,7 @@ import {
   Download,
   Lock,
   LogOut,
+  RefreshCw,
 } from "lucide-react";
 
 // ── Brand Logo (SVG) ──
@@ -922,9 +923,21 @@ export default function Home() {
             )}
 
             {previewUrl && (
-              <a href={previewUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/[0.08] transition-all">
-                <ExternalLink className="w-3 h-3" />
-              </a>
+              <>
+                <button
+                  onClick={() => {
+                    const iframe = document.querySelector<HTMLIFrameElement>("iframe[title='Cloned website preview']");
+                    if (iframe) iframe.src = iframe.src;
+                  }}
+                  className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/[0.08] transition-all"
+                  title="Reload preview"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                </button>
+                <a href={previewUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/[0.08] transition-all">
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </>
             )}
 
             {generatedFiles.length > 0 && (

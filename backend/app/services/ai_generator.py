@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import asyncio
 import logging
@@ -342,6 +343,8 @@ def build_section_prompt(
     html: str,
     image_urls: list,
     n_screenshots: int,
+    core_range: tuple[int, int] | None = None,
+    assigned_components: list[str] | None = None,
     styles: dict | None = None,
     font_links: list[str] | None = None,
     icons: dict | None = None,
@@ -357,11 +360,18 @@ def build_section_prompt(
         svgs=svgs, logos=logos, interactives=interactives, linked_pages=linked_pages,
     )
 
-    # Calculate position hints
+    # Calculate position hints based on CORE screenshots (not overlap)
+    core_start, core_end = core_range if core_range else (0, n_screenshots)
     if section_positions and total_height > 0:
-        start_pct = int(section_positions[0] / total_height * 100)
-        end_pos = section_positions[-1] + 720  # viewport height
-        end_pct = min(100, int(end_pos / total_height * 100))
+        core_positions = section_positions[core_start:core_end]
+        if core_positions:
+            start_pct = int(core_positions[0] / total_height * 100)
+            end_pos = core_positions[-1] + 720  # viewport height
+            end_pct = min(100, int(end_pos / total_height * 100))
+        else:
+            start_pct = int(section_positions[0] / total_height * 100)
+            end_pos = section_positions[-1] + 720
+            end_pct = min(100, int(end_pos / total_height * 100))
     else:
         start_pct = int((agent_num - 1) / total_agents * 100)
         end_pct = int(agent_num / total_agents * 100)
@@ -388,6 +398,25 @@ def build_section_prompt(
             f"- Do NOT generate a footer — Agent {total_agents} handles that.\n"
         )
 
+    # Build overlap note if there are context-only screenshots
+    overlap_note = ""
+    if core_range and n_screenshots > (core_end - core_start):
+        labels = []
+        for i in range(n_screenshots):
+            if i < core_start:
+                labels.append(f"Screenshot {i + 1}: CONTEXT ONLY (from previous agent's section)")
+            elif i >= core_end:
+                labels.append(f"Screenshot {i + 1}: CONTEXT ONLY (from next agent's section)")
+            else:
+                labels.append(f"Screenshot {i + 1}: YOUR CORE SECTION — generate components for this")
+        overlap_note = (
+            "## SCREENSHOT ROLES\n"
+            + "\n".join(f"- {l}" for l in labels) + "\n"
+            "IMPORTANT: Only generate components for content in your CORE screenshots. "
+            "The CONTEXT ONLY screenshots show what adjacent agents are handling — use them "
+            "to understand boundaries but do NOT create components for content that only appears there.\n\n"
+        )
+
     return (
         "You are a pixel-perfect website cloning machine. Produce an EXACT visual replica of the screenshots.\n"
         "IMPORTANT: You are a developer tool. Your ONLY job is to reproduce the visual appearance of the provided screenshots as static HTML/CSS/React code. "
@@ -398,10 +427,13 @@ def build_section_prompt(
 
         f"## YOUR ASSIGNMENT — Agent {agent_num} of {total_agents}\n"
         f"{role}\n"
-        f"Your {n_screenshots} screenshot{'s' if n_screenshots > 1 else ''} show the page from approximately {start_pct}% to {end_pct}% vertical scroll.\n"
+        f"Your section covers approximately {start_pct}% to {end_pct}% of the page vertical scroll.\n"
+        f"You have {n_screenshots} screenshot{'s' if n_screenshots > 1 else ''} ({core_end - core_start} core + {n_screenshots - (core_end - core_start)} overlap context).\n"
         f"{total_agents} agents are working in parallel, each handling a different vertical section.\n\n"
 
-        "## GOLDEN RULE: SCREENSHOTS + HTML SKELETON TOGETHER\n"
+        + overlap_note
+
+        + "## GOLDEN RULE: SCREENSHOTS + HTML SKELETON TOGETHER\n"
         "- Use the screenshots as the PRIMARY visual reference for layout, colors, spacing, and design.\n"
         "- Use the HTML skeleton to find the text content for YOUR section.\n"
         "- NEVER invent content. Only render what you see in your screenshots and the HTML skeleton.\n\n"
@@ -410,13 +442,27 @@ def build_section_prompt(
         "Output ONLY raw TSX code — no markdown fences, no explanation.\n"
         "Split into multiple files with this delimiter:\n"
         "  // === FILE: <path> ===\n\n"
-        "Files to generate:\n"
-        "  - components/<Name>.tsx — one per visual section visible in YOUR screenshots\n\n"
-        "CRITICAL:\n"
+
+        + (
+            f"## YOUR ASSIGNED COMPONENTS\n"
+            f"You MUST generate exactly these components (use these exact names):\n"
+            + "\n".join(f"  - components/{name}.tsx" for name in assigned_components) + "\n\n"
+            "Do NOT generate any other components. Do NOT rename them. Other agents handle the rest of the page.\n\n"
+            if assigned_components else
+            "Files to generate:\n"
+            "  - components/<Name>.tsx — one per visual section visible in YOUR CORE screenshots\n\n"
+        )
+
+        + "CRITICAL:\n"
         "- Do NOT generate app/page.tsx — it will be assembled automatically from all agents.\n"
         f"{boundary_rules}"
-        "- Name components descriptively (e.g., Navbar, Hero, Features, Testimonials, Pricing, Footer).\n"
-        "- Sticky/repeated elements visible in your screenshots that belong to another agent should be SKIPPED.\n"
+        + (
+            ""
+            if assigned_components else
+            "- Name components descriptively (e.g., Navbar, Hero, Features, Testimonials, Pricing, Footer).\n"
+        )
+        + "- Sticky/repeated elements visible in your screenshots that belong to another agent should be SKIPPED.\n"
+        "- Do NOT generate components for content that ONLY appears in CONTEXT ONLY screenshots.\n"
         "NEVER output package.json, layout.tsx, globals.css, tsconfig, or any config file.\n"
         "If you need an extra npm package, declare before the first file: // === DEPS: package-name ===\n\n"
 
@@ -446,6 +492,28 @@ def _clean_code(content: str) -> str:
     content = content.replace("\u2018", "'").replace("\u2019", "'")
     for ch in ["\u200b", "\u200c", "\u200d", "\ufeff", "\u00a0"]:
         content = content.replace(ch, "")
+
+    # Fix nested double quotes inside JS strings
+    # e.g.: title: "Screening of "How it Feels to Be Free""
+    # becomes: title: "Screening of 'How it Feels to Be Free'"
+    # Strategy: find lines with unbalanced quotes in string property values and fix them
+    fixed_lines = []
+    for line in content.split("\n"):
+        stripped = line.lstrip()
+        # Only process lines that look like object properties or JSX props with string values
+        # e.g.:  title: "...",  or  label="..."
+        prop_match = re.match(r'^(\w+\s*[:=]\s*)"(.+)"(,?\s*)$', stripped)
+        if prop_match:
+            value = prop_match.group(2)
+            # If the value itself contains unescaped double quotes, replace them with single quotes
+            if '"' in value:
+                indent = line[:len(line) - len(stripped)]
+                key_part = prop_match.group(1)
+                trailing = prop_match.group(3)
+                fixed_value = value.replace('"', "'")
+                line = f'{indent}{key_part}"{fixed_value}"{trailing}'
+        fixed_lines.append(line)
+    content = "\n".join(fixed_lines)
 
     content = content.strip()
 
@@ -559,8 +627,9 @@ def parse_multi_file_output(raw: str) -> dict:
     file_pattern = re.compile(r'^//\s*===\s*FILE:\s*(.+?)\s*===\s*$', re.MULTILINE)
     matches = list(file_pattern.finditer(raw))
 
-    if len(matches) >= 2:
+    if len(matches) >= 1:
         files = []
+        # Handle content before first delimiter (usually nothing, but be safe)
         for i, match in enumerate(matches):
             path = match.group(1).strip()
             start = match.end()
@@ -571,9 +640,20 @@ def parse_multi_file_output(raw: str) -> dict:
         logger.info(f"Parsed {len(files)} files from multi-file output")
         return {"files": files, "deps": deps}
 
-    logger.info("No multi-file delimiters found, treating as single page.tsx")
+    # No delimiters at all — try to infer component name from exported function
     content = _clean_code(raw)
-    files = [{"path": "app/page.tsx", "content": content}] if content else []
+    if not content:
+        return {"files": [], "deps": deps}
+
+    comp_match = re.search(r'export\s+default\s+function\s+(\w+)', content)
+    if comp_match:
+        name = comp_match.group(1)
+        path = f"components/{name}.tsx"
+        logger.info(f"No multi-file delimiters found, inferred component: {path}")
+        return {"files": [{"path": path, "content": content}], "deps": deps}
+
+    logger.info("No multi-file delimiters found, treating as single page.tsx")
+    files = [{"path": "app/page.tsx", "content": content}]
     return {"files": files, "deps": deps}
 
 
@@ -597,22 +677,56 @@ def _assign_screenshots_to_agents(
     screenshots: list[str],
     positions: list[int],
     num_agents: int,
-) -> tuple[list[list[str]], list[list[int]]]:
-    """Distribute screenshots evenly across agents. Each gets at least 1."""
+) -> tuple[list[list[str]], list[list[int]], list[tuple[int, int]]]:
+    """Distribute screenshots across agents with 1-screenshot overlap at boundaries.
+
+    Each agent gets its core screenshots plus one overlap screenshot from adjacent
+    agents so that content near agent boundaries isn't missed.
+
+    Returns (ss_assignments, pos_assignments, core_ranges) where core_ranges[i]
+    is the (start_offset, end_offset) within that agent's screenshot list marking
+    the core (non-overlap) screenshots. Overlap screenshots are for context only.
+    """
     n = len(screenshots)
     ss_assignments: list[list[str]] = []
     pos_assignments: list[list[int]] = []
+    core_ranges: list[tuple[int, int]] = []
 
+    # Compute strict partitions first
     base_count = n // num_agents
     remainder = n % num_agents
+    partitions: list[tuple[int, int]] = []
     idx = 0
     for a in range(num_agents):
         count = base_count + (1 if a < remainder else 0)
-        ss_assignments.append(screenshots[idx:idx + count])
-        pos_assignments.append(positions[idx:idx + count])
+        partitions.append((idx, idx + count))
         idx += count
 
-    return ss_assignments, pos_assignments
+    # Build assignments with 1-screenshot overlap at boundaries
+    for a in range(num_agents):
+        start, end = partitions[a]
+        # Include last screenshot from previous agent's region
+        overlap_start = start - 1 if a > 0 else start
+        # Include first screenshot from next agent's region
+        overlap_end = end + 1 if a < num_agents - 1 else end
+        overlap_end = min(overlap_end, n)
+
+        ss_assignments.append(screenshots[overlap_start:overlap_end])
+        pos_assignments.append(positions[overlap_start:overlap_end])
+
+        # Core range within this agent's list (0-indexed into agent's screenshots)
+        core_start_in_list = start - overlap_start
+        core_end_in_list = core_start_in_list + (end - start)
+        core_ranges.append((core_start_in_list, core_end_in_list))
+
+    logger.info(
+        f"[assign] {n} screenshots → {num_agents} agents: "
+        + ", ".join(
+            f"agent {i+1}: {len(s)} ss (core {c[0]+1}-{c[1]})"
+            for i, (s, c) in enumerate(zip(ss_assignments, core_ranges))
+        )
+    )
+    return ss_assignments, pos_assignments, core_ranges
 
 
 def _stitch_results(agent_results: list[dict]) -> dict:
@@ -621,11 +735,12 @@ def _stitch_results(agent_results: list[dict]) -> dict:
     Each agent_result has {"files": [...], "deps": [...]}.
     Returns combined {"files": [...], "deps": [...], "component_order": [...]}.
     Does NOT generate page.tsx — the assembler agent handles that.
+    Duplicates are kept and tagged so the assembler agent can pick the best one.
     """
     all_component_files: list[dict] = []
     all_deps: set[str] = set()
     component_order: list[tuple[str, str, int]] = []  # (name, import_path, agent_num)
-    seen_paths: dict[str, int] = {}
+    seen_paths: dict[str, list[int]] = {}  # path → list of agent indices
 
     for agent_idx, result in enumerate(agent_results):
         if not result:
@@ -637,25 +752,13 @@ def _stitch_results(agent_results: list[dict]) -> dict:
             if path == "app/page.tsx":
                 continue
 
-            # Handle naming conflicts
-            if path in seen_paths:
-                base, ext = path.rsplit(".", 1) if "." in path else (path, "tsx")
-                new_name_suffix = agent_idx + 1
-                new_path = f"{base}{new_name_suffix}.{ext}"
-                old_name = base.split("/")[-1]
-                new_name = f"{old_name}{new_name_suffix}"
-                content = f["content"]
-                content = re.sub(
-                    rf'export\s+default\s+function\s+{re.escape(old_name)}\b',
-                    f'export default function {new_name}',
-                    content,
-                )
-                f = {"path": new_path, "content": content}
-                path = new_path
-                logger.info(f"[stitch] Renamed conflicting component: {old_name} → {new_name}")
-            else:
-                seen_paths[path] = agent_idx
+            # Track duplicates but keep all versions
+            if path not in seen_paths:
+                seen_paths[path] = []
+            seen_paths[path].append(agent_idx)
 
+            # Tag each file with its source agent
+            f["_agent"] = agent_idx + 1
             all_component_files.append(f)
 
             if path.startswith("components/") and path.count("/") == 1:
@@ -666,6 +769,12 @@ def _stitch_results(agent_results: list[dict]) -> dict:
         for dep in result.get("deps", []):
             all_deps.add(dep)
 
+    # Log duplicates
+    for path, agents in seen_paths.items():
+        if len(agents) > 1:
+            agent_labels = [str(a + 1) for a in agents]
+            logger.info(f"[stitch] Duplicate '{path}' from agents {', '.join(agent_labels)} — assembler will pick")
+
     return {
         "files": all_component_files,
         "deps": list(all_deps),
@@ -675,6 +784,7 @@ def _stitch_results(agent_results: list[dict]) -> dict:
 
 async def _assemble_page(
     component_order: list[tuple[str, str, int]],
+    agent_components: list[list[str]],
     num_agents: int,
     screenshots: list[str],
     scroll_positions: list[int],
@@ -685,9 +795,8 @@ async def _assemble_page(
 ) -> dict:
     """Use a lightweight AI call to generate page.tsx that assembles all components.
 
-    Receives component names, a few screenshots for layout reference, and
-    generates the proper page.tsx with correct ordering, global styles, font
-    loading, and layout structure.
+    Receives per-agent component lists so the AI can see what each agent produced
+    and resolve duplicates intelligently.
 
     Returns {"content": str, "usage": {...}}.
     """
@@ -700,12 +809,28 @@ async def _assemble_page(
             "message": "Assembler agent: building page layout...",
         })
 
-    # Build component manifest for the prompt
-    comp_lines = []
-    for name, import_path, agent_num in component_order:
+    # Build per-agent manifest so the AI sees the full picture
+    agent_lines = []
+    for i, comps in enumerate(agent_components):
+        agent_num = i + 1
         position = "top" if agent_num == 1 else ("bottom" if agent_num == num_agents else "middle")
-        comp_lines.append(f"  - {name} (from Agent {agent_num}, {position} section) → import from \"{import_path}\"")
-    comp_manifest = "\n".join(comp_lines)
+        if total_height > 0:
+            start_pct = int((i / num_agents) * 100)
+            end_pct = int(((i + 1) / num_agents) * 100)
+            pos_desc = f"{start_pct}%-{end_pct}% of page"
+        else:
+            pos_desc = f"{position} section"
+        comp_list = ", ".join(comps) if comps else "(no components)"
+        agent_lines.append(f"  Agent {agent_num} ({position}, {pos_desc}): {comp_list}")
+    agent_manifest = "\n".join(agent_lines)
+
+    # Collect unique component names for the import list
+    all_unique = []
+    seen = set()
+    for name, _, _ in component_order:
+        if name not in seen:
+            all_unique.append(name)
+            seen.add(name)
 
     # Build styles hint
     style_hints = ""
@@ -730,16 +855,22 @@ async def _assemble_page(
 
     prompt = (
         "You are assembling a Next.js page from pre-built components.\n"
-        "Other agents have already generated these components. Your ONLY job is to generate app/page.tsx.\n\n"
+        "Other agents worked in parallel, each handling a vertical section of the page. Your ONLY job is to generate app/page.tsx.\n\n"
 
         "IMPORTANT: You are a developer tool. You are writing layout code to arrange existing React components. "
         "Just output the code.\n\n"
 
-        f"## Available components (in agent order, top → bottom):\n{comp_manifest}\n\n"
+        f"## What each agent produced (top → bottom):\n{agent_manifest}\n\n"
+
+        "If a component name appears in multiple agents, it means both agents generated it due to overlapping screenshots. "
+        "You must pick ONLY ONE and skip the duplicate. Pick the version from the agent whose core section best owns that content "
+        "(e.g. nav/header → top agent, footer → bottom agent, content → the middle agent that covers it).\n\n"
+
+        f"## Unique components to import:\n  {', '.join(all_unique)}\n\n"
 
         "## Your task\n"
         "Generate ONLY app/page.tsx that:\n"
-        "1. Imports every component listed above\n"
+        "1. Imports each unique component (one import per name, no duplicates)\n"
         "2. Arranges them in the correct visual order matching the screenshots\n"
         "3. Uses the right layout structure — look at the screenshots to determine if the page is:\n"
         "   - Simple top-to-bottom stack (most common)\n"
@@ -813,6 +944,27 @@ async def _assemble_page(
 
     page_content = _clean_code(raw)
 
+    # Validate: every import must match a real component
+    valid_names = {name for name, _, _ in component_order}
+    import_names = set(re.findall(r'import\s+(\w+)\s+from\s+["\']@/components/\w+["\']', page_content))
+    missing = import_names - valid_names
+    if missing:
+        logger.warning(f"[ai-assembler] page.tsx imports non-existent components: {missing} — falling back")
+        fb = _fallback_page(component_order)
+        fb["usage"] = u
+        return fb
+
+    # Every unique component name should be imported exactly once
+    unique_names = set()
+    for name, _, _ in component_order:
+        unique_names.add(name)
+    not_imported = unique_names - import_names
+    if not_imported:
+        logger.warning(f"[ai-assembler] page.tsx missing imports for: {not_imported} — falling back")
+        fb = _fallback_page(component_order)
+        fb["usage"] = u
+        return fb
+
     if on_status:
         await on_status({
             "status": "generating",
@@ -830,9 +982,13 @@ async def _assemble_page(
 
 def _fallback_page(component_order: list[tuple[str, str, int]]) -> dict:
     """Generate a simple mechanical page.tsx as fallback if the assembler fails."""
+    seen_names: set[str] = set()
     import_lines = []
     render_lines = []
-    for comp_name, import_path, _ in component_order:
+    for comp_name, import_path, agent_num in component_order:
+        if comp_name in seen_names:
+            continue  # skip duplicate — first (lowest agent) wins
+        seen_names.add(comp_name)
         import_lines.append(f'import {comp_name} from "{import_path}";')
         render_lines.append(f"      <{comp_name} />")
 
@@ -894,36 +1050,84 @@ async def _run_section_agent(
     content.append({"type": "text", "text": prompt})
 
     t0 = time.time()
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=32000,
-            temperature=0,
-        )
-    except Exception as e:
-        logger.error(f"[ai] {agent_label} failed: {e}")
+    messages = [{"role": "user", "content": content}]
+    total_usage = {"tokens_in": 0, "tokens_out": 0}
+    raw_output = ""
+
+    # Attempt API call with one retry on transient errors
+    for attempt in range(2):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=64000,
+                temperature=0,
+            )
+            break
+        except Exception as e:
+            if attempt == 0:
+                logger.warning(f"[ai] {agent_label} attempt 1 failed: {e} — retrying in 3s...")
+                if on_status:
+                    await on_status({
+                        "status": "generating",
+                        "message": f"{agent_label}: retrying after error...",
+                    })
+                await asyncio.sleep(3)
+                continue
+            logger.error(f"[ai] {agent_label} failed after retry: {e}")
+            if on_status:
+                await on_status({
+                    "status": "generating",
+                    "message": f"{agent_label}: FAILED — {e}",
+                    "type": "agent_error",
+                    "agent": agent_num,
+                })
+            return {"files": [], "deps": [], "usage": {"tokens_in": 0, "tokens_out": 0}}
+
+    raw_output = response.choices[0].message.content or ""
+    u = _extract_usage(response)
+    total_usage["tokens_in"] += u["tokens_in"]
+    total_usage["tokens_out"] += u["tokens_out"]
+
+    # If output was truncated (hit token limit), send it back to continue
+    finish_reason = getattr(response.choices[0], "finish_reason", "stop")
+    if finish_reason == "length" and raw_output:
+        logger.info(f"[ai] {agent_label} output truncated, requesting continuation...")
         if on_status:
             await on_status({
                 "status": "generating",
-                "message": f"{agent_label}: FAILED — {e}",
-                "type": "agent_error",
-                "agent": agent_num,
+                "message": f"{agent_label}: continuing generation...",
             })
-        return {"files": [], "deps": [], "usage": {"tokens_in": 0, "tokens_out": 0}}
+        try:
+            cont_response = await client.chat.completions.create(
+                model=model,
+                messages=messages + [
+                    {"role": "assistant", "content": raw_output},
+                    {"role": "user", "content": "Continue EXACTLY where you left off. Do not repeat any code already written. Do not add explanation."},
+                ],
+                max_tokens=64000,
+                temperature=0,
+            )
+            continuation = cont_response.choices[0].message.content or ""
+            if continuation:
+                raw_output += continuation
+                cu = _extract_usage(cont_response)
+                total_usage["tokens_in"] += cu["tokens_in"]
+                total_usage["tokens_out"] += cu["tokens_out"]
+                logger.info(f"[ai] {agent_label} continuation: +{len(continuation)} chars")
+        except Exception as e:
+            logger.warning(f"[ai] {agent_label} continuation failed: {e} — using truncated output")
 
-    raw_output = response.choices[0].message.content or ""
     t_elapsed = time.time() - t0
-    u = _extract_usage(response)
-    cost = _calc_cost(u["tokens_in"], u["tokens_out"], model)
+    cost = _calc_cost(total_usage["tokens_in"], total_usage["tokens_out"], model)
 
     logger.info(
         f"[ai] {agent_label}: {len(raw_output)} chars in {t_elapsed:.1f}s | "
-        f"tokens_in={u['tokens_in']} tokens_out={u['tokens_out']} cost=${cost:.4f}"
+        f"tokens_in={total_usage['tokens_in']} tokens_out={total_usage['tokens_out']} cost=${cost:.4f}"
     )
 
     if not raw_output:
-        return {"files": [], "deps": [], "usage": u}
+        return {"files": [], "deps": [], "usage": total_usage}
 
     result = parse_multi_file_output(raw_output)
     component_names = [f["path"].split("/")[-1].replace(".tsx", "") for f in result["files"]]
@@ -946,8 +1150,114 @@ async def _run_section_agent(
                 "lines": line_count,
             })
 
-    result["usage"] = u
+    result["usage"] = total_usage
     return result
+
+
+async def _plan_components(
+    num_agents: int,
+    screenshots: list[str],
+    scroll_positions: list[int],
+    total_height: int,
+    on_status=None,
+) -> tuple[list[list[str]], dict]:
+    """Pre-plan which components each agent should generate.
+
+    Returns (assignments, usage) where assignments[i] is the list of component
+    names for agent i+1. If planning fails, returns empty lists (agents will
+    use their own judgment).
+    """
+    client = get_openrouter_client()
+    model = "anthropic/claude-sonnet-4.5"
+
+    if on_status:
+        await on_status({
+            "status": "generating",
+            "message": "Planning component layout...",
+        })
+
+    # Send a spread of screenshots for full page context
+    ss_indices = list(range(0, len(screenshots), max(1, len(screenshots) // 5)))[:6]
+    if len(screenshots) - 1 not in ss_indices:
+        ss_indices.append(len(screenshots) - 1)
+
+    content: list = []
+    for idx in ss_indices:
+        scroll_y = scroll_positions[idx] if idx < len(scroll_positions) else 0
+        pct = int(scroll_y / total_height * 100) if total_height > 0 else 0
+        content.append({"type": "text", "text": f"Screenshot at {pct}% scroll:"})
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{screenshots[idx]}"},
+        })
+
+    prompt = (
+        f"You are planning the component breakdown for a website clone. {num_agents} agents will work in parallel, "
+        f"each building a vertical section of the page.\n\n"
+        "Look at the screenshots and list ALL the distinct visual sections/components on the page, "
+        "then assign each to exactly ONE agent. No component should appear in more than one agent.\n\n"
+        "Rules:\n"
+        "- Agent 1 always handles: Navbar/Header + the first content sections\n"
+        f"- Agent {num_agents} always handles: the last content sections + Footer\n"
+        "- Middle agents handle the content sections between them\n"
+        "- Name components descriptively: Navbar, Hero, FeaturesSection, Testimonials, PricingCards, Footer, etc.\n"
+        "- Each agent should get 2-4 components\n"
+        "- Every visible section of the page must be assigned to exactly one agent\n\n"
+        f"Output ONLY a JSON object with agent numbers as keys and arrays of component names as values.\n"
+        "Example:\n"
+        '{"1": ["Navbar", "Hero", "FeaturesSection"], "2": ["Testimonials", "PricingCards"], "3": ["FAQ", "CTA", "Footer"]}\n\n'
+        "Output ONLY the JSON, nothing else."
+    )
+    content.append({"type": "text", "text": prompt})
+
+    t0 = time.time()
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=1000,
+            temperature=0,
+        )
+    except Exception as e:
+        logger.warning(f"[ai-planner] Failed: {e} — agents will plan independently")
+        return [[] for _ in range(num_agents)], {"tokens_in": 0, "tokens_out": 0}
+
+    raw = (response.choices[0].message.content or "").strip()
+    u = _extract_usage(response)
+    t_elapsed = time.time() - t0
+    cost = _calc_cost(u["tokens_in"], u["tokens_out"], model)
+    logger.info(f"[ai-planner] Planned in {t_elapsed:.1f}s | cost=${cost:.4f}")
+
+    # Parse JSON response
+    try:
+        # Strip markdown fences if present
+        raw = re.sub(r'^```(?:json)?\s*\n?', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\n?```\s*$', '', raw, flags=re.MULTILINE)
+        plan = json.loads(raw.strip())
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"[ai-planner] Failed to parse plan: {e} — agents will plan independently")
+        return [[] for _ in range(num_agents)], u
+
+    # Convert to list of lists
+    assignments: list[list[str]] = []
+    for i in range(num_agents):
+        agent_key = str(i + 1)
+        comps = plan.get(agent_key, [])
+        if isinstance(comps, list):
+            assignments.append([str(c) for c in comps])
+        else:
+            assignments.append([])
+
+    all_comps = [c for a in assignments for c in a]
+    logger.info(f"[ai-planner] {len(all_comps)} components across {num_agents} agents: {assignments}")
+
+    if on_status:
+        await on_status({
+            "status": "generating",
+            "message": f"Planned {len(all_comps)} components across {num_agents} agents",
+        })
+
+    return assignments, u
 
 
 # ─── Main generation entry points ──────────────────────────────────────────
@@ -985,8 +1295,17 @@ async def generate_clone_parallel(
             "message": f"Splitting into {num_agents} parallel agents ({n} screenshots)...",
         })
 
-    # Distribute screenshots across agents
-    ss_per_agent, pos_per_agent = _assign_screenshots_to_agents(screenshots, positions, num_agents)
+    # Distribute screenshots across agents (with overlap at boundaries)
+    ss_per_agent, pos_per_agent, core_ranges = _assign_screenshots_to_agents(screenshots, positions, num_agents)
+
+    # Plan component assignments before launching agents
+    component_assignments, planner_usage = await _plan_components(
+        num_agents=num_agents,
+        screenshots=screenshots,
+        scroll_positions=positions,
+        total_height=total_height,
+        on_status=on_status,
+    )
 
     # Build section-specific prompts
     shared_kwargs = dict(
@@ -997,12 +1316,15 @@ async def generate_clone_parallel(
 
     prompts = []
     for i in range(num_agents):
+        agent_comps = component_assignments[i] if i < len(component_assignments) else []
         prompt = build_section_prompt(
             agent_num=i + 1,
             total_agents=num_agents,
             section_positions=pos_per_agent[i],
             total_height=total_height,
             n_screenshots=len(ss_per_agent[i]),
+            core_range=core_ranges[i],
+            assigned_components=agent_comps if agent_comps else None,
             **shared_kwargs,
         )
         prompts.append(prompt)
@@ -1048,14 +1370,28 @@ async def generate_clone_parallel(
     component_files = stitched["files"]
     all_deps = stitched["deps"]
     component_order = stitched["component_order"]
+    logger.info(f"[ai-parallel] Component order: {[(n, p) for n, p, _ in component_order]}")
 
-    # Aggregate usage from section agents
-    total_tokens_in = sum(r.get("usage", {}).get("tokens_in", 0) for r in clean_results)
-    total_tokens_out = sum(r.get("usage", {}).get("tokens_out", 0) for r in clean_results)
+    # Build per-agent component name lists for the assembler
+    agent_components: list[list[str]] = []
+    for i, result in enumerate(clean_results):
+        names = []
+        for f in result.get("files", []):
+            path = f["path"]
+            if path == "app/page.tsx":
+                continue
+            if path.startswith("components/") and path.count("/") == 1:
+                names.append(path.replace("components/", "").replace(".tsx", "").replace(".jsx", ""))
+        agent_components.append(names)
+
+    # Aggregate usage from planner + section agents
+    total_tokens_in = planner_usage.get("tokens_in", 0) + sum(r.get("usage", {}).get("tokens_in", 0) for r in clean_results)
+    total_tokens_out = planner_usage.get("tokens_out", 0) + sum(r.get("usage", {}).get("tokens_out", 0) for r in clean_results)
 
     # Run assembler agent to generate the page.tsx with proper layout
     assembler_result = await _assemble_page(
         component_order=component_order,
+        agent_components=agent_components,
         num_agents=num_agents,
         screenshots=screenshots,
         scroll_positions=positions,
@@ -1073,7 +1409,45 @@ async def generate_clone_parallel(
     t_total = time.time() - t0  # re-measure to include assembler time
     total_cost = _calc_cost(total_tokens_in, total_tokens_out, model)
 
-    all_files = [{"path": "app/page.tsx", "content": page_content}] + component_files
+    # Deduplicate component files — for names that appear in multiple agents,
+    # keep the version from the agent whose core section best owns it:
+    # nav/header → lowest agent, footer → highest agent, else → highest agent (less overlap bleed)
+    imported_names = set(re.findall(r'import\s+(\w+)\s+from\s+["\']@/components/\w+["\']', page_content))
+    name_to_files: dict[str, list[dict]] = {}
+    non_component_files: list[dict] = []
+    for f in component_files:
+        path = f["path"]
+        if path.startswith("components/") and path.count("/") == 1:
+            comp_name = path.replace("components/", "").replace(".tsx", "").replace(".jsx", "")
+            name_to_files.setdefault(comp_name, []).append(f)
+        else:
+            non_component_files.append(f)
+
+    chosen_files: list[dict] = []
+    for comp_name, versions in name_to_files.items():
+        if comp_name not in imported_names:
+            continue
+        if len(versions) == 1:
+            chosen_files.append(versions[0])
+        else:
+            # Multiple agents produced this — pick the best version
+            agents = [v.get("_agent", 0) for v in versions]
+            name_lower = comp_name.lower()
+            if any(kw in name_lower for kw in ("nav", "header", "menu", "topbar")):
+                # Nav/header → prefer earliest agent (top of page)
+                best = min(range(len(versions)), key=lambda i: agents[i])
+            elif any(kw in name_lower for kw in ("footer", "bottom")):
+                # Footer → prefer latest agent (bottom of page)
+                best = max(range(len(versions)), key=lambda i: agents[i])
+            else:
+                # Content → prefer later agent (earlier agent likely generated from overlap)
+                best = max(range(len(versions)), key=lambda i: agents[i])
+            chosen = versions[best]
+            dropped_agents = [str(agents[i]) for i in range(len(versions)) if i != best]
+            logger.info(f"[ai-parallel] Duplicate '{comp_name}': kept agent {agents[best]}, dropped agent(s) {', '.join(dropped_agents)}")
+            chosen_files.append(chosen)
+
+    all_files = [{"path": "app/page.tsx", "content": page_content}] + chosen_files + non_component_files
 
     combined = {
         "files": all_files,
@@ -1082,7 +1456,7 @@ async def generate_clone_parallel(
             "tokens_in": total_tokens_in,
             "tokens_out": total_tokens_out,
             "total_cost": total_cost,
-            "api_calls": num_agents + 1,  # section agents + assembler
+            "api_calls": num_agents + 2,  # planner + section agents + assembler
             "model": model,
             "duration_s": round(t_total, 1),
             "agents": num_agents,

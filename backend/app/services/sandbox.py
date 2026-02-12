@@ -118,23 +118,33 @@ def upload_file_to_sandbox(clone_id: str, file_path: str, content: str) -> bool:
         logger.warning(f"No sandbox instance for clone {clone_id}")
         return False
 
+    full_path = f"{project_dir}/{file_path}"
+    # Ensure parent directory exists
+    parent_dir = "/".join(full_path.split("/")[:-1])
     try:
-        full_path = f"{project_dir}/{file_path}"
-        # Ensure parent directory exists
-        parent_dir = "/".join(full_path.split("/")[:-1])
+        sandbox.process.exec(f"mkdir -p {parent_dir}", timeout=5)
+    except Exception:
+        pass
+
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            sandbox.process.exec(f"mkdir -p {parent_dir}", timeout=5)
-        except Exception:
-            pass
-        sandbox.fs.upload_file(
-            content.encode("utf-8"),
-            full_path,
-        )
-        logger.info(f"Uploaded {file_path} to sandbox {clone_id}")
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to upload {file_path} to sandbox {clone_id}: {e}")
-        return False
+            sandbox.fs.upload_file(
+                content.encode("utf-8"),
+                full_path,
+            )
+            logger.info(f"Uploaded {file_path} to sandbox {clone_id}")
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                import time
+                wait = 1 * (attempt + 1)
+                logger.warning(f"Upload {file_path} failed (attempt {attempt + 1}/{max_retries}): {e} — retrying in {wait}s")
+                time.sleep(wait)
+            else:
+                logger.warning(f"Failed to upload {file_path} to sandbox {clone_id} after {max_retries} attempts: {e}")
+                return False
+    return False
 
 
 async def install_extra_deps(
@@ -270,6 +280,19 @@ async def cleanup_sandbox(clone_id: str) -> None:
     # Get the Daytona sandbox ID from either the object or the ID map
     if sandbox and not sandbox_id:
         sandbox_id = getattr(sandbox, "id", None)
+
+    # Fallback: look up Daytona sandbox ID from database (survives server restarts)
+    if not sandbox_id:
+        try:
+            from app.database import get_supabase
+            client = get_supabase()
+            if client:
+                result = client.table("clones").select("sandbox_url").eq("id", clone_id).execute()
+                if result.data and result.data[0].get("sandbox_url"):
+                    sandbox_id = result.data[0]["sandbox_url"]
+                    logger.info(f"[sandbox:{clone_id}] Recovered Daytona ID from database: {sandbox_id}")
+        except Exception:
+            pass
 
     if not sandbox_id:
         logger.info(f"[sandbox:{clone_id}] No sandbox ID found to clean up")

@@ -513,7 +513,10 @@ async def _run_clone(clone_id: str, url: str, status_queue: asyncio.Queue, clien
         )
 
         # Save to DB — use the same clone_id so storage files match the DB record
-        db_record = await save_clone(url=url, preview_url=preview_url, clone_id=clone_id)
+        # Include Daytona sandbox ID so cleanup works even after server restarts
+        from app.services.sandbox import _sandbox_id_map
+        daytona_id = _sandbox_id_map.get(clone_id)
+        db_record = await save_clone(url=url, preview_url=preview_url, clone_id=clone_id, sandbox_url=daytona_id)
         if db_record:
             logger.info(f"[clone:{clone_id}] Saved to database")
 
@@ -835,6 +838,23 @@ async def proxy_sandbox(clone_id: str, path: str):
         # Log the error body so we can debug compilation failures
         error_snippet = resp.text[:500] if resp.text else "(empty)"
         logger.warning(f"[proxy:{clone_id}] Sandbox returned {resp.status_code}: {error_snippet}")
+
+        # On 500, try to read the Next.js dev server log for the real error
+        if resp.status_code == 500:
+            try:
+                from app.services.sandbox import _sandbox_instances
+                sandbox = _sandbox_instances.get(clone_id)
+                if sandbox:
+                    log_result = sandbox.process.exec("tail -30 /tmp/next-dev.log 2>/dev/null", timeout=5)
+                    log_text = log_result.output if hasattr(log_result, "output") else str(log_result)
+                    # Extract error lines
+                    error_lines = [l for l in log_text.split("\n") if any(kw in l for kw in ["Error", "error", "Module not found", "Cannot find"])]
+                    if error_lines:
+                        logger.error(f"[proxy:{clone_id}] next-dev.log errors:\n" + "\n".join(error_lines[:10]))
+                    else:
+                        logger.info(f"[proxy:{clone_id}] next-dev.log tail:\n{log_text[-500:]}")
+            except Exception as log_err:
+                logger.warning(f"[proxy:{clone_id}] Could not read next-dev.log: {log_err}")
 
     content_type = resp.headers.get("content-type", "")
 
