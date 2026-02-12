@@ -4,7 +4,7 @@ An AI-powered website cloning tool. Enter a URL, and it scrapes, screenshots, an
 
 **Deployed project:** https://clonr-two.vercel.app/
 
-**Demo video:** `<ADD_VIDEO_LINK>`
+**Demo video:** https://youtu.be/WkTeL1-oDPY
 
 ## Architecture
 
