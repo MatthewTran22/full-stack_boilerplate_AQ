@@ -460,11 +460,17 @@ async def _detect_interactives(page) -> list[dict]:
         if not triggers:
             return {"toggles": [], "linked_pages": []}
 
+        # Cap triggers to avoid spending too long on interactive detection
+        MAX_TRIGGERS = 8
+        if len(triggers) > MAX_TRIGGERS:
+            logger.info(f"Found {len(triggers)} triggers, capping to {MAX_TRIGGERS}")
+            triggers = triggers[:MAX_TRIGGERS]
+
         logger.info(f"Found {len(triggers)} trigger candidates to interact with")
 
         async def _bounce_back():
             await page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(500)
             await page.evaluate(FIND_TRIGGERS_JS)
 
         def _diff_hidden(before: dict, after: dict) -> tuple[list[dict], list[dict]]:
@@ -509,8 +515,8 @@ async def _detect_interactives(page) -> list[dict]:
                 # --- HOVER first ---
                 hidden_before = await page.evaluate(SNAPSHOT_HIDDEN_JS)
 
-                await el.hover(timeout=2000)
-                await page.wait_for_timeout(350)
+                await el.hover(timeout=1500)
+                await page.wait_for_timeout(200)
 
                 hidden_after_hover = await page.evaluate(SNAPSHOT_HIDDEN_JS)
                 hover_revealed, hover_hidden = _diff_hidden(hidden_before, hidden_after_hover)
@@ -522,14 +528,14 @@ async def _detect_interactives(page) -> list[dict]:
                         f"revealed {len(hover_revealed)}, hid {len(hover_hidden)}"
                     )
                     await page.mouse.move(0, 0)
-                    await page.wait_for_timeout(250)
+                    await page.wait_for_timeout(150)
                     continue
 
                 # --- CLICK (hover didn't reveal anything) ---
                 hidden_before = await page.evaluate(SNAPSHOT_HIDDEN_JS)
 
-                await el.click(timeout=2000, no_wait_after=True)
-                await page.wait_for_timeout(400)
+                await el.click(timeout=1500, no_wait_after=True)
+                await page.wait_for_timeout(250)
 
                 if page.url != original_url:
                     nav_url = page.url
@@ -573,7 +579,7 @@ async def _detect_interactives(page) -> list[dict]:
 
 
 
-async def scrape_and_capture(url: str) -> dict:
+async def scrape_and_capture(url: str, on_status=None) -> dict:
     """
     Full Playwright scrape: HTML, viewport screenshots, image URLs,
     computed styles, font/icon links, rendered SVGs, logos.
@@ -609,45 +615,60 @@ async def scrape_and_capture(url: str) -> dict:
         )
         await stealth.apply_stealth_async(context)
         page = await context.new_page()
+        if on_status:
+            await on_status({"status": "scraping", "message": "Loading page..."})
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(1500)
 
-        # Get HTML
+        # Get HTML + extract all page data in a SINGLE evaluate call to minimize round-trips
+        if on_status:
+            await on_status({"status": "scraping", "message": "Extracting page content..."})
         html = await page.content()
 
-        # Extract computed styles
+        # Batch all extractions into one JS round-trip
         try:
-            styles = await page.evaluate(EXTRACT_STYLES_JS)
-        except Exception:
-            styles = {"fonts": [], "colors": [], "gradients": []}
-
-        # Extract font/icon CDN links
-        try:
-            font_links = await page.evaluate(EXTRACT_FONT_LINKS_JS)
-        except Exception:
-            font_links = []
-
-        # Extract icon usage
-        try:
-            icons = await page.evaluate(EXTRACT_ICONS_JS)
-        except Exception:
-            icons = {"fontAwesome": [], "materialIcons": [], "customIconClasses": []}
-
-        # Extract RENDERED SVGs (resolves <use> refs in the live DOM)
-        try:
-            svgs = await page.evaluate(EXTRACT_RENDERED_SVGS_JS)
+            batch_result = await page.evaluate("""
+            () => {
+                const result = {};
+                try { result.styles = (%s)(); } catch(e) { result.styles = {fonts:[], colors:[], gradients:[]}; }
+                try { result.fontLinks = (%s)(); } catch(e) { result.fontLinks = []; }
+                try { result.icons = (%s)(); } catch(e) { result.icons = {fontAwesome:[], materialIcons:[], customIconClasses:[]}; }
+                try { result.svgs = (%s)(); } catch(e) { result.svgs = []; }
+                try { result.logos = (%s)(); } catch(e) { result.logos = []; }
+                return result;
+            }
+            """ % (EXTRACT_STYLES_JS, EXTRACT_FONT_LINKS_JS, EXTRACT_ICONS_JS, EXTRACT_RENDERED_SVGS_JS, EXTRACT_LOGO_IMAGES_JS))
+            styles = batch_result.get("styles", {"fonts": [], "colors": [], "gradients": []})
+            font_links = batch_result.get("fontLinks", [])
+            icons = batch_result.get("icons", {"fontAwesome": [], "materialIcons": [], "customIconClasses": []})
+            svgs = batch_result.get("svgs", [])
+            logos = batch_result.get("logos", [])
         except Exception as e:
-            logger.warning(f"SVG extraction failed: {e}")
-            svgs = []
+            logger.warning(f"Batch extraction failed, falling back to sequential: {e}")
+            # Fallback to sequential if batch fails
+            try:
+                styles = await page.evaluate(EXTRACT_STYLES_JS)
+            except Exception:
+                styles = {"fonts": [], "colors": [], "gradients": []}
+            try:
+                font_links = await page.evaluate(EXTRACT_FONT_LINKS_JS)
+            except Exception:
+                font_links = []
+            try:
+                icons = await page.evaluate(EXTRACT_ICONS_JS)
+            except Exception:
+                icons = {"fontAwesome": [], "materialIcons": [], "customIconClasses": []}
+            try:
+                svgs = await page.evaluate(EXTRACT_RENDERED_SVGS_JS)
+            except Exception:
+                svgs = []
+            try:
+                logos = await page.evaluate(EXTRACT_LOGO_IMAGES_JS)
+            except Exception:
+                logos = []
 
-        # Extract logo images (position + ancestor based)
-        try:
-            logos = await page.evaluate(EXTRACT_LOGO_IMAGES_JS)
-            for logo in logos:
-                logger.info(f"  Logo detected: {logo.get('url', '?')[:100]} ({logo.get('width')}x{logo.get('height')}, reason={logo.get('reason')})")
-        except Exception as e:
-            logger.warning(f"Logo extraction failed: {e}")
-            logos = []
+        for logo in logos:
+            logger.info(f"  Logo detected: {logo.get('url', '?')[:100]} ({logo.get('width')}x{logo.get('height')}, reason={logo.get('reason')})")
 
         # Get total page height — handle SPAs where body.scrollHeight is 0
         # by finding the actual scrollable container
@@ -728,10 +749,12 @@ async def scrape_and_capture(url: str) -> dict:
             # Distribute evenly: last screenshot anchored to bottom
             stride = (total_height - VIEWPORT_HEIGHT) / (num_screenshots - 1)
 
+        if on_status:
+            await on_status({"status": "scraping", "message": f"Taking {num_screenshots} screenshot{'s' if num_screenshots > 1 else ''}..."})
         for i in range(num_screenshots):
             scroll_y = min(int(i * stride), max(0, total_height - VIEWPORT_HEIGHT))
             await page.evaluate(scroll_js, scroll_y)
-            await page.wait_for_timeout(400)
+            await page.wait_for_timeout(200)
             vp_bytes = await page.screenshot(type="png")
             full_b64 = _resize_screenshot(vp_bytes)
             screenshots_b64.append(full_b64)
@@ -746,8 +769,10 @@ async def scrape_and_capture(url: str) -> dict:
 
         # Detect interactive toggle relationships by clicking buttons
         # Done AFTER screenshots so clicks don't affect the visual captures
+        if on_status:
+            await on_status({"status": "scraping", "message": "Analyzing interactive elements..."})
         await page.evaluate(scroll_js, 0)
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(150)
         interactive_result = await _detect_interactives(page)
         interactives = interactive_result["toggles"]
         linked_pages = interactive_result["linked_pages"]
@@ -755,6 +780,8 @@ async def scrape_and_capture(url: str) -> dict:
         await browser.close()
 
     # Parse HTML for image URLs
+    if on_status:
+        await on_status({"status": "scraping", "message": "Processing HTML and extracting images..."})
     soup = BeautifulSoup(html, "html.parser")
     image_urls = _extract_image_urls(soup, url)
 

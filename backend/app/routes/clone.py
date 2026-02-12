@@ -307,11 +307,26 @@ async def _run_clone(clone_id: str, url: str, status_queue: asyncio.Queue, clien
         async def on_status(message):
             await status_queue.put(message)
 
-        # Step 1: Scrape the website
+        # Start sandbox setup early — it doesn't depend on scrape results
+        all_template_files = get_template_files()
+
+        async def _setup_sandbox():
+            try:
+                return await setup_sandbox_shell(
+                    template_files=all_template_files,
+                    clone_id=clone_id,
+                )
+            except Exception as e:
+                logger.error(f"[clone:{clone_id}] Sandbox setup failed: {e}")
+                return False
+
+        sandbox_task = asyncio.create_task(_setup_sandbox())
+
+        # Step 1: Scrape the website (sandbox spins up in parallel)
         await status_queue.put({"status": "scraping", "message": "Scraping website...", "clone_id": clone_id})
         t0 = time.time()
         try:
-            scrape_result = await scrape_and_capture(url)
+            scrape_result = await scrape_and_capture(url, on_status=on_status)
             screenshots = scrape_result["screenshots"]
             html_source = scrape_result["html"]
             image_urls = scrape_result["image_urls"]
@@ -327,6 +342,7 @@ async def _run_clone(clone_id: str, url: str, status_queue: asyncio.Queue, clien
             page_total_height = scrape_result.get("total_height", 0)
         except Exception as e:
             logger.error(f"[clone:{clone_id}] Scraping failed for {url}: {e}")
+            sandbox_task.cancel()
             await status_queue.put({"status": "error", "message": f"Failed to scrape website: {e}"})
             return
         t_scrape = time.time() - t0
@@ -342,24 +358,9 @@ async def _run_clone(clone_id: str, url: str, status_queue: asyncio.Queue, clien
             "screenshots": screenshots,
         })
 
-        # Step 2: AI generation + sandbox setup IN PARALLEL
+        # Step 2: AI generation (sandbox already spinning up from Step 1)
         await status_queue.put({"status": "generating", "message": "AI is generating the clone..."})
         t1 = time.time()
-
-        all_template_files = get_template_files()
-
-        async def _setup_sandbox():
-            try:
-                return await setup_sandbox_shell(
-                    template_files=all_template_files,
-                    clone_id=clone_id,
-                    on_status=on_status,
-                )
-            except Exception as e:
-                logger.error(f"[clone:{clone_id}] Sandbox setup failed: {e}")
-                return False
-
-        sandbox_task = asyncio.create_task(_setup_sandbox())
 
         try:
             ai_result = await generate_clone(

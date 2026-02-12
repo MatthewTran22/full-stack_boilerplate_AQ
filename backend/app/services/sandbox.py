@@ -44,7 +44,7 @@ async def setup_sandbox_shell(
         daytona = Daytona(config)
 
         if on_status:
-            await on_status("Creating sandbox...")
+            await on_status({"status": "deploying", "message": "Creating sandbox..."})
 
         logger.info(f"[sandbox:{clone_id}] Creating Daytona sandbox...")
         image = Image.base("node:20-slim")
@@ -67,7 +67,7 @@ async def setup_sandbox_shell(
         logger.info(f"[sandbox:{clone_id}] Created sandbox {sandbox_id} in {t_create:.1f}s")
 
         if on_status:
-            await on_status("Uploading template files...")
+            await on_status({"status": "deploying", "message": "Uploading template files..."})
 
         t_upload = time.time()
         for tf in template_files:
@@ -81,7 +81,7 @@ async def setup_sandbox_shell(
 
         # npm install
         if on_status:
-            await on_status("Installing dependencies (npm install)...")
+            await on_status({"status": "deploying", "message": "Installing dependencies (npm install)..."})
 
         t_npm = time.time()
         try:
@@ -170,7 +170,7 @@ async def install_extra_deps(
     logger.info(f"[deps:{clone_id}] Installing {len(safe_deps)} extra deps: {dep_str}")
 
     if on_status:
-        await on_status(f"Installing extra dependencies: {', '.join(safe_deps)}...")
+        await on_status({"status": "deploying", "message": f"Installing extra dependencies: {', '.join(safe_deps)}..."})
 
     try:
         result = sandbox.process.exec(
@@ -206,7 +206,7 @@ async def start_dev_server(
 
     try:
         if on_status:
-            await on_status("Starting dev server...")
+            await on_status({"status": "deploying", "message": "Starting dev server..."})
 
         logger.info(f"[dev:{clone_id}] Starting next dev on port 3000...")
         # Start next dev in background (non-blocking)
