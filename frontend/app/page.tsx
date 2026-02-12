@@ -406,7 +406,6 @@ export default function Home() {
           }
           if (data.preview_url) setPreviewUrl(resolveApiUrl(data.preview_url));
           getClones(1, 5).then((res) => { setHistory(res.items); setClonePages(res.pages); setCloneTotal(res.total); setClonePage(1); }).catch(() => {});
-          getAuthStatus().then((s) => { setDailyClonesUsed(s.daily_clones_used); setDailyCloneLimit(s.daily_clone_limit); }).catch(() => {});
         } else if (data.status === "error") {
           setStatus("error");
           setError(data.message || "Unknown error");
@@ -578,8 +577,6 @@ export default function Home() {
     );
   };
 
-  const dailyClonesRemaining = dailyCloneLimit - dailyClonesUsed;
-
   // ══════════════════════════════════════
   // ── AUTH: Loading / Password gate ──
   // ══════════════════════════════════════
@@ -687,10 +684,7 @@ export default function Home() {
             <ClonrLogoSmall />
             <span className="text-sm font-semibold tracking-tight">Clonr</span>
           </div>
-          <div className="flex items-center gap-4">
-            <span className="text-[11px] font-mono text-muted-foreground/50 tabular-nums">
-              {dailyClonesRemaining}/{dailyCloneLimit} clones left today
-            </span>
+          <div className="flex items-center gap-3">
             <div className="flex items-center gap-2 text-xs text-muted-foreground font-mono">
               <div className="w-1.5 h-1.5 rounded-full bg-emerald-500/80 animate-pulse" />
               operational
@@ -775,10 +769,10 @@ export default function Home() {
                 />
                 <button
                   type="submit"
-                  disabled={!url.trim() || (backgrounded && isLoading) || dailyClonesRemaining <= 0}
+                  disabled={!url.trim() || (backgrounded && isLoading)}
                   className="shrink-0 bg-white text-black rounded-lg px-4 py-2 text-xs font-semibold hover:bg-white/90 disabled:opacity-20 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-2 tracking-wide uppercase"
                 >
-                  {dailyClonesRemaining <= 0 ? "Limit reached" : backgrounded && isLoading ? "Running..." : "Clone"}
+                  {backgrounded && isLoading ? "Running..." : "Clone"}
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -900,7 +894,6 @@ export default function Home() {
         <div className="w-px h-4 bg-[hsl(0,0%,18%)]" />
         <span className="text-xs text-muted-foreground/60 truncate max-w-[300px] font-mono">{url.replace(/^https?:\/\//, "")}</span>
         <div className="flex-1" />
-        <span className="text-[10px] font-mono text-muted-foreground/35 tabular-nums shrink-0">{dailyClonesRemaining}/{dailyCloneLimit} clones left</span>
 
         {hasResult && (
           <>

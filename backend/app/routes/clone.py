@@ -551,11 +551,6 @@ async def clone_website(request: CloneRequest, raw_request: Request):
         if not token or not _verify_token(token):
             raise HTTPException(status_code=401, detail="Not authenticated. Please enter the site password.")
 
-    # Daily limit check
-    daily_count = await get_daily_clone_count()
-    if daily_count >= DAILY_CLONE_LIMIT:
-        raise HTTPException(status_code=429, detail=f"Daily clone limit reached ({DAILY_CLONE_LIMIT} clones per 24 hours). Please try again later.")
-
     url = request.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
