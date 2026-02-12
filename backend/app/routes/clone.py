@@ -80,12 +80,79 @@ _recreation_failed: set[str] = set()
 
 LOADING_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3">
-<style>body{display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
-font-family:system-ui,sans-serif;background:#0a0a0a;color:#fff}
-.spinner{width:24px;height:24px;border:3px solid #333;border-top-color:#fff;
-border-radius:50%;animation:spin 0.8s linear infinite;margin-right:12px}
-@keyframes spin{to{transform:rotate(360deg)}}</style></head>
-<body><div class="spinner"></div>Rebuilding sandbox… this page will auto-refresh.</body></html>"""
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{display:flex;align-items:center;justify-content:center;height:100vh;
+font-family:system-ui,sans-serif;background:#111;color:#fff;overflow:hidden}
+.wrap{text-align:center;position:relative}
+.cpu{position:relative;width:200px;height:200px;margin:0 auto 28px}
+.core{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+width:64px;height:64px;border-radius:14px;background:#151515;
+border:1px solid rgba(255,255,255,.12);display:flex;align-items:center;
+justify-content:center;z-index:2;animation:core-glow 3s ease-in-out infinite}
+@keyframes core-glow{
+0%,100%{box-shadow:0 0 20px rgba(80,150,255,.25),0 0 50px rgba(80,150,255,.08),inset 0 0 15px rgba(80,150,255,.04)}
+50%{box-shadow:0 0 40px rgba(80,150,255,.45),0 0 80px rgba(80,150,255,.15),inset 0 0 25px rgba(80,150,255,.08)}
+}
+.core svg{width:36px;height:36px;opacity:.9}
+svg.traces{position:absolute;inset:0;width:100%;height:100%}
+.trace-bg{stroke:rgba(255,255,255,.05);stroke-width:1.5;fill:none}
+.trace{stroke-width:2;fill:none;stroke-dasharray:30 70;stroke-dashoffset:100;
+stroke-linecap:round}
+@keyframes pulse{0%{stroke-dashoffset:100;opacity:0}12%{opacity:1}88%{opacity:1}100%{stroke-dashoffset:0;opacity:0}}
+.t1{stroke:#4a9eff;animation:pulse 2.4s ease-in-out 0s infinite;filter:drop-shadow(0 0 3px #4a9eff)}
+.t2{stroke:#5cb8ff;animation:pulse 2.4s ease-in-out .35s infinite;filter:drop-shadow(0 0 3px #5cb8ff)}
+.t3{stroke:#3d8be6;animation:pulse 2.4s ease-in-out .7s infinite;filter:drop-shadow(0 0 3px #3d8be6)}
+.t4{stroke:#6ac4ff;animation:pulse 2.4s ease-in-out 1.05s infinite;filter:drop-shadow(0 0 3px #6ac4ff)}
+.t5{stroke:#2e7dd6;animation:pulse 2.4s ease-in-out 1.4s infinite;filter:drop-shadow(0 0 3px #2e7dd6)}
+.dot{fill:rgba(255,255,255,.15);r:1.5}
+.label{font-size:12px;color:rgba(255,255,255,.4);letter-spacing:.08em;font-variant:small-caps}
+</style></head>
+<body><div class="wrap">
+<div class="cpu">
+<svg class="traces" viewBox="0 0 200 200" fill="none">
+<path class="trace-bg" d="M100 0v60"/><path class="trace t1" d="M100 0v60"/>
+<path class="trace-bg" d="M70 5v45l20 15"/><path class="trace t2" d="M70 5v45l20 15"/>
+<path class="trace-bg" d="M130 5v45l-20 15"/><path class="trace t3" d="M130 5v45l-20 15"/>
+<path class="trace-bg" d="M100 200v-60"/><path class="trace t1" d="M100 200v-60"/>
+<path class="trace-bg" d="M70 195v-45l20-15"/><path class="trace t4" d="M70 195v-45l20-15"/>
+<path class="trace-bg" d="M130 195v-45l-20-15"/><path class="trace t5" d="M130 195v-45l-20-15"/>
+<path class="trace-bg" d="M0 100h60"/><path class="trace t3" d="M0 100h60"/>
+<path class="trace-bg" d="M5 70h45l15 20"/><path class="trace t4" d="M5 70h45l15 20"/>
+<path class="trace-bg" d="M5 130h45l15-20"/><path class="trace t2" d="M5 130h45l15-20"/>
+<path class="trace-bg" d="M200 100h-60"/><path class="trace t5" d="M200 100h-60"/>
+<path class="trace-bg" d="M195 70h-45l-15 20"/><path class="trace t1" d="M195 70h-45l-15 20"/>
+<path class="trace-bg" d="M195 130h-45l-15-20"/><path class="trace t3" d="M195 130h-45l-15-20"/>
+<path class="trace-bg" d="M25 25l40 40"/><path class="trace t2" d="M25 25l40 40"/>
+<path class="trace-bg" d="M175 25l-40 40"/><path class="trace t5" d="M175 25l-40 40"/>
+<path class="trace-bg" d="M25 175l40-40"/><path class="trace t4" d="M25 175l40-40"/>
+<path class="trace-bg" d="M175 175l-40-40"/><path class="trace t1" d="M175 175l-40-40"/>
+<circle class="dot" cx="100" cy="60"/><circle class="dot" cx="90" cy="65"/><circle class="dot" cx="110" cy="65"/>
+<circle class="dot" cx="100" cy="140"/><circle class="dot" cx="90" cy="135"/><circle class="dot" cx="110" cy="135"/>
+<circle class="dot" cx="60" cy="100"/><circle class="dot" cx="65" cy="90"/><circle class="dot" cx="65" cy="110"/>
+<circle class="dot" cx="140" cy="100"/><circle class="dot" cx="135" cy="90"/><circle class="dot" cx="135" cy="110"/>
+<circle class="dot" cx="65" cy="65"/><circle class="dot" cx="135" cy="65"/>
+<circle class="dot" cx="65" cy="135"/><circle class="dot" cx="135" cy="135"/>
+</svg>
+<div class="core">
+<svg viewBox="0 0 173 173" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="172.339" height="172.339" rx="10" fill="#fff"/>
+<rect x="79" y="36" width="20" height="7.5" rx=".96" fill="#111"/>
+<rect x="72" y="49" width="20" height="7.5" rx=".96" fill="#111"/>
+<rect x="65" y="63" width="33" height="7.5" rx=".96" fill="#111"/>
+<rect x="59" y="76" width="19" height="7.5" rx=".96" fill="#111"/>
+<rect x="51" y="90" width="60" height="7.5" rx=".96" fill="#111"/>
+<rect x="45" y="104" width="20" height="7.5" rx=".96" fill="#111"/>
+<rect x="110" y="104" width="18" height="7.5" rx=".96" fill="#111"/>
+<rect x="40" y="118" width="20" height="7.5" rx=".96" fill="#111"/>
+<rect x="115" y="118" width="21" height="7.5" rx=".96" fill="#111"/>
+<rect x="23" y="131" width="45" height="7.5" rx=".96" fill="#111"/>
+<rect x="109" y="131" width="40" height="7.5" rx=".96" fill="#111"/>
+</svg>
+</div>
+</div>
+<p class="label">rebuilding sandbox</p>
+</div></body></html>"""
 
 
 class CloneRequest(BaseModel):
