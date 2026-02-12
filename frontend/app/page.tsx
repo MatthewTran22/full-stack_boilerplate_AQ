@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import { motion, AnimatePresence } from "framer-motion";
 import JSZip from "jszip";
-import { startClone, getClones, getCloneFiles, getPreviewUrl, resolveApiUrl, endSandbox, getBeaconEndUrl, type CloneHistoryItem, type CloneFile, type CloneEvent, type CloneUsage } from "@/lib/api";
+import { startClone, getClones, getCloneFiles, getPreviewUrl, resolveApiUrl, endSandbox, getBeaconEndUrl, login, getAuthStatus, getStoredToken, clearToken, type CloneHistoryItem, type CloneFile, type CloneEvent, type CloneUsage } from "@/lib/api";
 import {
   Globe,
   Loader2,
@@ -32,6 +32,8 @@ import {
   Folder,
   Plus,
   Download,
+  Lock,
+  LogOut,
 } from "lucide-react";
 
 // ── Brand Logo (SVG) ──
@@ -154,6 +156,15 @@ function getIconForStatus(status: string, message: string): MessageLogEntry["ico
 }
 
 export default function Home() {
+  // ── Auth state ──
+  const [isAuthed, setIsAuthed] = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [dailyClonesUsed, setDailyClonesUsed] = useState(0);
+  const [dailyCloneLimit, setDailyCloneLimit] = useState(10);
+
   const [url, setUrl] = useState("");
   const [cloneId, setCloneId] = useState<string | null>(null);
   const [status, setStatus] = useState<CloneStatus>("idle");
@@ -196,6 +207,48 @@ export default function Home() {
     el.style.setProperty("--mouse-x", `${x}%`);
     el.style.setProperty("--mouse-y", `${y}%`);
   }, []);
+
+  // ── Check auth on mount ──
+  useEffect(() => {
+    const token = getStoredToken();
+    if (!token) {
+      setAuthChecking(false);
+      return;
+    }
+    getAuthStatus()
+      .then((s) => {
+        setIsAuthed(true);
+        setDailyClonesUsed(s.daily_clones_used);
+        setDailyCloneLimit(s.daily_clone_limit);
+      })
+      .catch(() => {
+        clearToken();
+      })
+      .finally(() => setAuthChecking(false));
+  }, []);
+
+  const handleLogin = async () => {
+    if (!password.trim()) return;
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const res = await login(password.trim());
+      setIsAuthed(true);
+      setDailyClonesUsed(res.daily_clones_used);
+      setDailyCloneLimit(res.daily_clone_limit);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Authentication failed");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    clearToken();
+    setIsAuthed(false);
+    setPassword("");
+    setAuthError(null);
+  };
 
   useEffect(() => {
     getClones(clonePage, 5).then((res) => {
@@ -353,6 +406,7 @@ export default function Home() {
           }
           if (data.preview_url) setPreviewUrl(resolveApiUrl(data.preview_url));
           getClones(1, 5).then((res) => { setHistory(res.items); setClonePages(res.pages); setCloneTotal(res.total); setClonePage(1); }).catch(() => {});
+          getAuthStatus().then((s) => { setDailyClonesUsed(s.daily_clones_used); setDailyCloneLimit(s.daily_clone_limit); }).catch(() => {});
         } else if (data.status === "error") {
           setStatus("error");
           setError(data.message || "Unknown error");
@@ -360,8 +414,13 @@ export default function Home() {
         }
       });
     } catch (err) {
-      setStatus("error");
       const msg = err instanceof Error ? err.message : "Something went wrong";
+      if (msg.includes("Not authenticated") || msg.includes("password")) {
+        clearToken();
+        setIsAuthed(false);
+        return;
+      }
+      setStatus("error");
       setError(msg);
       addMessageLog("error", msg, "error");
     }
@@ -519,6 +578,80 @@ export default function Home() {
     );
   };
 
+  const dailyClonesRemaining = dailyCloneLimit - dailyClonesUsed;
+
+  // ══════════════════════════════════════
+  // ── AUTH: Loading / Password gate ──
+  // ══════════════════════════════════════
+  if (authChecking) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (!isAuthed) {
+    return (
+      <div className="grain min-h-screen flex flex-col items-center justify-center relative overflow-hidden">
+        <div className="fixed inset-0 dot-grid pointer-events-none" />
+        <div className="fixed inset-0 pointer-events-none" style={{
+          background: "radial-gradient(ellipse 80% 60% at 50% 40%, transparent 30%, hsl(0 0% 7%) 80%)",
+        }} />
+
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+          className="relative z-10 flex flex-col items-center w-full max-w-sm px-6"
+        >
+          <div className="mb-8">
+            <ClonrLogo size={64} />
+          </div>
+
+          <h1 className="text-2xl font-bold tracking-tight mb-2">Clonr</h1>
+          <p className="text-muted-foreground text-sm mb-8">Enter the password to continue</p>
+
+          <form
+            onSubmit={(e) => { e.preventDefault(); handleLogin(); }}
+            className="w-full space-y-4"
+          >
+            <div className="relative">
+              <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <input
+                type="password"
+                placeholder="Password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoFocus
+                className="w-full bg-[hsl(0,0%,10%)] border border-[hsl(0,0%,18%)] rounded-lg pl-10 pr-4 py-3 text-sm font-mono outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/25 transition-all placeholder:text-[hsl(0,0%,35%)]"
+              />
+            </div>
+
+            {authError && (
+              <motion.p
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="text-destructive text-xs font-mono text-center"
+              >
+                {authError}
+              </motion.p>
+            )}
+
+            <button
+              type="submit"
+              disabled={!password.trim() || authLoading}
+              className="w-full bg-white text-black rounded-lg py-3 text-sm font-semibold hover:bg-white/90 disabled:opacity-30 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+            >
+              {authLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRight className="w-4 h-4" />}
+              {authLoading ? "Checking..." : "Enter"}
+            </button>
+          </form>
+        </motion.div>
+      </div>
+    );
+  }
+
   // ══════════════════════════════════════
   // ── IDLE: Landing page with effects ──
   // ══════════════════════════════════════
@@ -554,9 +687,17 @@ export default function Home() {
             <ClonrLogoSmall />
             <span className="text-sm font-semibold tracking-tight">Clonr</span>
           </div>
-          <div className="flex items-center gap-2 text-xs text-muted-foreground font-mono">
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500/80 animate-pulse" />
-            operational
+          <div className="flex items-center gap-4">
+            <span className="text-[11px] font-mono text-muted-foreground/50 tabular-nums">
+              {dailyClonesRemaining}/{dailyCloneLimit} clones left today
+            </span>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground font-mono">
+              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500/80 animate-pulse" />
+              operational
+            </div>
+            <button onClick={handleLogout} className="p-1.5 rounded-md hover:bg-white/[0.08] transition-colors text-muted-foreground/40 hover:text-muted-foreground" title="Sign out">
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
           </div>
         </motion.nav>
 
@@ -634,10 +775,10 @@ export default function Home() {
                 />
                 <button
                   type="submit"
-                  disabled={!url.trim() || (backgrounded && isLoading)}
+                  disabled={!url.trim() || (backgrounded && isLoading) || dailyClonesRemaining <= 0}
                   className="shrink-0 bg-white text-black rounded-lg px-4 py-2 text-xs font-semibold hover:bg-white/90 disabled:opacity-20 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-2 tracking-wide uppercase"
                 >
-                  {backgrounded && isLoading ? "Running..." : "Clone"}
+                  {dailyClonesRemaining <= 0 ? "Limit reached" : backgrounded && isLoading ? "Running..." : "Clone"}
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -759,6 +900,7 @@ export default function Home() {
         <div className="w-px h-4 bg-[hsl(0,0%,18%)]" />
         <span className="text-xs text-muted-foreground/60 truncate max-w-[300px] font-mono">{url.replace(/^https?:\/\//, "")}</span>
         <div className="flex-1" />
+        <span className="text-[10px] font-mono text-muted-foreground/35 tabular-nums shrink-0">{dailyClonesRemaining}/{dailyCloneLimit} clones left</span>
 
         {hasResult && (
           <>

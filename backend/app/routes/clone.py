@@ -4,6 +4,8 @@ import uuid
 import asyncio
 import logging
 import time
+import hmac
+import hashlib
 import ipaddress
 import socket
 import httpx
@@ -26,6 +28,7 @@ from app.database import (
     save_clone,
     get_clones,
     get_clone,
+    get_daily_clone_count,
     upload_static_files,
     download_static_file,
     list_storage_files,
@@ -35,6 +38,65 @@ from app.database import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ── Auth configuration ──
+# Store only the SHA-256 hash of the password in the env var — never plaintext.
+# Generate with: python3 -c "import hashlib; print(hashlib.sha256(b'yourpassword').hexdigest())"
+SITE_PASSWORD_HASH = os.getenv("SITE_PASSWORD_HASH", "")
+DAILY_CLONE_LIMIT = int(os.getenv("DAILY_CLONE_LIMIT", "10"))
+
+
+def _hash_password(password: str) -> str:
+    """SHA-256 hash a plaintext password."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def _make_token(password_hash: str) -> str:
+    """Generate a deterministic HMAC session token from the password hash."""
+    return hmac.new(password_hash.encode(), b"clonr-session", hashlib.sha256).hexdigest()
+
+
+def _verify_token(token: str) -> bool:
+    """Check if the provided token matches the expected HMAC."""
+    if not SITE_PASSWORD_HASH:
+        return True  # No password configured — open access
+    expected = _make_token(SITE_PASSWORD_HASH)
+    return hmac.compare_digest(token, expected)
+
+
+def _get_token_from_request(request: Request) -> str | None:
+    """Extract Bearer token from Authorization header."""
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return None
+
+
+class AuthRequest(BaseModel):
+    password: str
+
+
+@router.post("/api/auth")
+async def authenticate(body: AuthRequest):
+    """Validate the site password and return a session token."""
+    if not SITE_PASSWORD_HASH:
+        raise HTTPException(status_code=500, detail="SITE_PASSWORD_HASH not configured")
+    incoming_hash = _hash_password(body.password)
+    if not hmac.compare_digest(incoming_hash, SITE_PASSWORD_HASH):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = _make_token(SITE_PASSWORD_HASH)
+    count = await get_daily_clone_count()
+    return {"token": token, "daily_clones_used": count, "daily_clone_limit": DAILY_CLONE_LIMIT}
+
+
+@router.get("/api/auth/status")
+async def auth_status(request: Request):
+    """Return remaining daily clones for an authenticated session."""
+    token = _get_token_from_request(request)
+    if not token or not _verify_token(token):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    count = await get_daily_clone_count()
+    return {"daily_clones_used": count, "daily_clone_limit": DAILY_CLONE_LIMIT}
 
 
 def _is_safe_url(url: str) -> bool:
@@ -483,6 +545,17 @@ async def _run_clone(clone_id: str, url: str, status_queue: asyncio.Queue, clien
 @router.post("/api/clone")
 async def clone_website(request: CloneRequest, raw_request: Request):
     """Clone a website: scrape, screenshot, generate Next.js files, deploy to sandbox."""
+    # Auth check
+    if SITE_PASSWORD_HASH:
+        token = _get_token_from_request(raw_request)
+        if not token or not _verify_token(token):
+            raise HTTPException(status_code=401, detail="Not authenticated. Please enter the site password.")
+
+    # Daily limit check
+    daily_count = await get_daily_clone_count()
+    if daily_count >= DAILY_CLONE_LIMIT:
+        raise HTTPException(status_code=429, detail=f"Daily clone limit reached ({DAILY_CLONE_LIMIT} clones per 24 hours). Please try again later.")
+
     url = request.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url

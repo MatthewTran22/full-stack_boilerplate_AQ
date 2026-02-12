@@ -2,6 +2,7 @@ import math
 import os
 import logging
 import mimetypes
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,26 @@ async def get_clones(page: int = 1, per_page: int = 30) -> dict:
     except Exception as e:
         logger.error(f"Failed to get clones: {e}")
         return {"items": [], "total": 0, "page": page, "pages": 0}
+
+
+async def get_daily_clone_count() -> int:
+    """Count clones created in the last 24 hours."""
+    client = get_supabase()
+    if client is None:
+        return 0
+
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        result = (
+            client.table("clones")
+            .select("id", count="exact")
+            .gte("created_at", since)
+            .execute()
+        )
+        return result.count if result.count is not None else 0
+    except Exception as e:
+        logger.error(f"Failed to get daily clone count: {e}")
+        return 0
 
 
 async def get_clone(clone_id: str) -> Optional[dict]:

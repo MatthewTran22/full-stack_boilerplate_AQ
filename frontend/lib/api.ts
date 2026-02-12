@@ -1,5 +1,65 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// ── Auth helpers ──
+
+export interface AuthResponse {
+  token: string;
+  daily_clones_used: number;
+  daily_clone_limit: number;
+}
+
+export interface AuthStatus {
+  daily_clones_used: number;
+  daily_clone_limit: number;
+}
+
+export function getStoredToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("clonr_token");
+}
+
+export function storeToken(token: string): void {
+  localStorage.setItem("clonr_token", token);
+}
+
+export function clearToken(): void {
+  localStorage.removeItem("clonr_token");
+}
+
+function authHeaders(token?: string | null): Record<string, string> {
+  const t = token || getStoredToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+export async function login(password: string): Promise<AuthResponse> {
+  const response = await fetch(`${API_URL}/api/auth`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: "Authentication failed" }));
+    throw new Error(err.detail || "Authentication failed");
+  }
+  const data: AuthResponse = await response.json();
+  storeToken(data.token);
+  return data;
+}
+
+export async function getAuthStatus(): Promise<AuthStatus> {
+  const response = await fetch(`${API_URL}/api/auth/status`, {
+    headers: authHeaders(),
+  });
+  if (!response.ok) {
+    if (response.status === 401) {
+      clearToken();
+      throw new Error("Session expired");
+    }
+    throw new Error("Failed to get auth status");
+  }
+  return response.json();
+}
+
 export interface CloneHistoryItem {
   id: string;
   url: string;
@@ -63,7 +123,7 @@ export async function startClone(
 ): Promise<void> {
   const response = await fetch(`${API_URL}/api/clone`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ url }),
   });
 
