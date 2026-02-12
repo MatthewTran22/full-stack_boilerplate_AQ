@@ -17,6 +17,7 @@ from app.services.sandbox import (
     setup_sandbox_shell,
     upload_file_to_sandbox,
     start_dev_server,
+    cleanup_sandbox,
 )
 from app.services.template_loader import get_template_files
 from app.database import (
@@ -172,7 +173,8 @@ async def clone_website(request: CloneRequest, raw_request: Request):
         await _clone_semaphore.acquire()
         try:
             # Step 1: Scrape the website
-            yield sse_event({"status": "scraping", "message": "Scraping website..."})
+            sandbox_clone_id = clone_id  # preserve original for sandbox cleanup
+            yield sse_event({"status": "scraping", "message": "Scraping website...", "clone_id": clone_id})
             t0 = time.time()
             try:
                 scrape_result = await scrape_and_capture(url)
@@ -187,6 +189,7 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 scraped_interactives = scrape_result.get("interactives", [])
                 scraped_linked_pages = scrape_result.get("linked_pages", [])
                 scroll_positions = scrape_result.get("scroll_positions", [])
+                scraped_region_types = scrape_result.get("region_types")
                 page_total_height = scrape_result.get("total_height", 0)
             except Exception as e:
                 logger.error(f"[clone:{clone_id}] Scraping failed for {url}: {e}")
@@ -206,7 +209,7 @@ async def clone_website(request: CloneRequest, raw_request: Request):
             })
 
             # Step 2: AI generation + sandbox setup IN PARALLEL
-            gen_msg = f"AI is generating the clone ({len(screenshots)} sections)..." if len(screenshots) > 1 else "AI is generating the clone..."
+            gen_msg = "AI is generating the clone..."
             yield sse_event({"status": "generating", "message": gen_msg})
             t1 = time.time()
 
@@ -245,6 +248,7 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                         linked_pages=scraped_linked_pages,
                         scroll_positions=scroll_positions,
                         total_height=page_total_height,
+                        region_types=scraped_region_types,
                         on_status=on_status,
                     )
                     ai_result_box.append(result)
@@ -257,7 +261,7 @@ async def clone_website(request: CloneRequest, raw_request: Request):
             # Stream progress events in real-time while AI generates
             while True:
                 try:
-                    event = await asyncio.wait_for(status_queue.get(), timeout=120.0)
+                    event = await asyncio.wait_for(status_queue.get(), timeout=300.0)
                 except asyncio.TimeoutError:
                     if ai_task.done():
                         break
@@ -500,6 +504,11 @@ async def clone_website(request: CloneRequest, raw_request: Request):
         finally:
             _clone_semaphore.release()
             logger.info(f"[clone:{clone_id}] Released slot (slots={_clone_semaphore._value}/{MAX_CONCURRENT_CLONES})")
+            # On SSE disconnect (client closed tab mid-stream), clean up the sandbox
+            if sandbox_clone_id not in _sandbox_urls:
+                # Sandbox was never fully set up or already removed — clean up instance
+                await cleanup_sandbox(sandbox_clone_id)
+                logger.info(f"[clone:{sandbox_clone_id}] Cleaned up sandbox on stream end")
 
         yield "data: [DONE]\n\n"
 
@@ -624,6 +633,22 @@ async def _recreate_sandbox(clone_id: str) -> None:
         logger.error(f"[recreate:{clone_id}] Recreation failed: {e}")
     finally:
         _recreating.discard(clone_id)
+
+
+@router.delete("/api/sandbox/{clone_id}")
+async def delete_sandbox(clone_id: str):
+    """Delete a Daytona sandbox to free resources."""
+    _sandbox_urls.pop(clone_id, None)
+    await cleanup_sandbox(clone_id)
+    return {"ok": True}
+
+
+@router.post("/api/sandbox/{clone_id}/end")
+async def end_sandbox(clone_id: str):
+    """Beacon-compatible endpoint to clean up a sandbox (POST-only for sendBeacon)."""
+    _sandbox_urls.pop(clone_id, None)
+    await cleanup_sandbox(clone_id)
+    return {"ok": True}
 
 
 @router.get("/api/sandbox/{clone_id}/{path:path}")

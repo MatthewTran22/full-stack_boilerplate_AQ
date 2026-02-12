@@ -202,6 +202,7 @@ EXTRACT_RENDERED_SVGS_JS = """
 """
 
 # JS to extract logo images (broadened detection — position-based + ancestor-based)
+
 EXTRACT_LOGO_IMAGES_JS = """
 () => {
     const logos = [];
@@ -571,6 +572,7 @@ async def _detect_interactives(page) -> list[dict]:
     return {"toggles": results, "linked_pages": linked_pages}
 
 
+
 async def scrape_and_capture(url: str) -> dict:
     """
     Full Playwright scrape: HTML, viewport screenshots, image URLs,
@@ -711,8 +713,11 @@ async def scrape_and_capture(url: str) -> dict:
         # Take viewport screenshots evenly spaced to cover the full page
         screenshots_b64 = []
         scroll_positions = []
+        region_types = []
         viewports_needed = max(1, -(-total_height // VIEWPORT_HEIGHT))  # ceil division
-        num_screenshots = min(MAX_SCREENSHOTS, viewports_needed)
+        # Single-agent mode: cap at 3 screenshots to keep payload manageable
+        num_screenshots = min(viewports_needed, 3)
+        logger.info(f"Page needs {viewports_needed} viewports → using {num_screenshots} screenshots")
         # Stride: for short pages use viewport height (no gaps),
         # for tall pages space evenly so all sections are captured
         if num_screenshots <= 1:
@@ -722,14 +727,22 @@ async def scrape_and_capture(url: str) -> dict:
         else:
             # Distribute evenly: last screenshot anchored to bottom
             stride = (total_height - VIEWPORT_HEIGHT) / (num_screenshots - 1)
+
         for i in range(num_screenshots):
             scroll_y = min(int(i * stride), max(0, total_height - VIEWPORT_HEIGHT))
             await page.evaluate(scroll_js, scroll_y)
             await page.wait_for_timeout(400)
             vp_bytes = await page.screenshot(type="png")
-            screenshots_b64.append(_resize_screenshot(vp_bytes))
+            full_b64 = _resize_screenshot(vp_bytes)
+            screenshots_b64.append(full_b64)
+            region_types.append("full")
             scroll_positions.append(scroll_y)
-        logger.info(f"{num_screenshots} viewport screenshots captured (page height: {total_height}px, stride: {stride:.0f}px, positions: {scroll_positions})")
+
+        logger.info(
+            f"{len(screenshots_b64)} viewport screenshots captured "
+            f"(page height: {total_height}px, stride: {stride:.0f}px, "
+            f"positions: {scroll_positions}, regions: {region_types})"
+        )
 
         # Detect interactive toggle relationships by clicking buttons
         # Done AFTER screenshots so clicks don't affect the visual captures
@@ -760,6 +773,7 @@ async def scrape_and_capture(url: str) -> dict:
         "html": cleaned_html,
         "screenshots": screenshots_b64,
         "scroll_positions": scroll_positions,
+        "region_types": region_types,
         "total_height": total_height,
         "image_urls": image_urls,
         "styles": styles,

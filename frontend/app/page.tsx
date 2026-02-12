@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import { motion, AnimatePresence } from "framer-motion";
-import { startClone, getClones, getPreviewUrl, resolveApiUrl, type CloneHistoryItem, type CloneFile, type CloneEvent, type CloneUsage } from "@/lib/api";
+import { startClone, getClones, getPreviewUrl, resolveApiUrl, endSandbox, getBeaconEndUrl, type CloneHistoryItem, type CloneFile, type CloneEvent, type CloneUsage } from "@/lib/api";
 import {
   Globe,
   Loader2,
@@ -153,6 +153,7 @@ function getIconForStatus(status: string, message: string): MessageLogEntry["ico
 
 export default function Home() {
   const [url, setUrl] = useState("");
+  const [cloneId, setCloneId] = useState<string | null>(null);
   const [status, setStatus] = useState<CloneStatus>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [generatedFiles, setGeneratedFiles] = useState<CloneFile[]>([]);
@@ -180,6 +181,7 @@ export default function Home() {
   const logIdRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const spotlightRef = useRef<HTMLDivElement>(null);
+  const cloneIdRef = useRef<string | null>(null);
 
   // ── Mouse spotlight tracker ──
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -207,6 +209,16 @@ export default function Home() {
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logEntries]);
+
+  // Clean up sandbox when user closes tab
+  useEffect(() => {
+    if (!cloneId) return;
+    const handleBeforeUnload = () => {
+      navigator.sendBeacon(getBeaconEndUrl(cloneId));
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [cloneId]);
 
   useEffect(() => {
     const isActive = status === "scraping" || status === "generating" || status === "deploying";
@@ -241,7 +253,12 @@ export default function Home() {
     let targetUrl = url.trim();
     if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
 
+    // Clean up previous sandbox before starting new clone
+    if (cloneIdRef.current) endSandbox(cloneIdRef.current);
+
     setStatus("scraping");
+    setCloneId(null);
+    cloneIdRef.current = null;
     setError(null);
     setPreviewUrl(null);
     setGeneratedFiles([]);
@@ -259,6 +276,11 @@ export default function Home() {
 
     try {
       await startClone(targetUrl, (data: CloneEvent) => {
+        // Capture sandbox clone_id from the first event only (later events have DB id)
+        if (data.clone_id && !cloneIdRef.current) {
+          cloneIdRef.current = data.clone_id;
+          setCloneId(data.clone_id);
+        }
         if (data.status === "file_write") {
           if (data.file && data.lines) addFileLog(data.file, data.lines);
         } else if (data.status === "screenshot") {
@@ -342,17 +364,23 @@ export default function Home() {
   };
 
   const handleHistoryClick = (item: CloneHistoryItem) => {
+    if (cloneIdRef.current) endSandbox(cloneIdRef.current);
     const previewLink = item.preview_url?.includes("/api/static/") ? resolveApiUrl(item.preview_url) : getPreviewUrl(item.id);
     setPreviewUrl(previewLink);
     setStatus("done");
     setUrl(item.url);
+    setCloneId(null);
+    cloneIdRef.current = null;
     setGeneratedFiles([]);
     setLogEntries([{ kind: "message", id: 1, icon: "done", message: "Loaded from history", timestamp: new Date(), status: "done" }]);
   };
 
   const reset = () => {
+    if (cloneIdRef.current) endSandbox(cloneIdRef.current);
     setStatus("idle");
     setUrl("");
+    setCloneId(null);
+    cloneIdRef.current = null;
     setPreviewUrl(null);
     setGeneratedFiles([]);
     setError(null);

@@ -133,6 +133,18 @@ export function getPreviewUrl(cloneId: string): string {
   return `${API_URL}/api/preview/${cloneId}`;
 }
 
+export async function endSandbox(cloneId: string): Promise<void> {
+  try {
+    await fetch(`${API_URL}/api/sandbox/${cloneId}`, { method: "DELETE" });
+  } catch {
+    // Best-effort cleanup — ignore network errors
+  }
+}
+
+export function getBeaconEndUrl(cloneId: string): string {
+  return `${API_URL}/api/sandbox/${cloneId}/end`;
+}
+
 export function resolveApiUrl(path: string): string {
   // If it's already a full URL, return as-is
   if (path.startsWith("http://") || path.startsWith("https://")) return path;
