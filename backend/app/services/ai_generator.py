@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import asyncio
 import logging
 from openai import AsyncOpenAI
 
@@ -13,6 +14,8 @@ MODEL_PRICING = {
     "anthropic/claude-sonnet-4": {"input": 3.00, "output": 15.00},
 }
 DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
+
+MAX_PARALLEL_AGENTS = 5
 
 
 def _extract_usage(response) -> dict:
@@ -44,10 +47,11 @@ def get_openrouter_client() -> AsyncOpenAI:
     return _client
 
 
-def build_prompt(
+# ─── Shared context building ───────────────────────────────────────────────
+
+def _build_shared_context(
     html: str,
     image_urls: list,
-    n: int,
     styles: dict | None = None,
     font_links: list[str] | None = None,
     icons: dict | None = None,
@@ -55,8 +59,8 @@ def build_prompt(
     logos: list[dict] | None = None,
     interactives: list[dict] | None = None,
     linked_pages: list[dict] | None = None,
-) -> str:
-    """Build the clone prompt with HTML, image URLs, styles, icons, SVGs, logos."""
+) -> dict:
+    """Build shared context sections used by both full and section prompts."""
     max_html = 30000
     truncated_html = html[:max_html]
     if len(html) > max_html:
@@ -88,7 +92,7 @@ def build_prompt(
     else:
         image_list = "  (none extracted)"
 
-    # Build styles section from Playwright-extracted data
+    # Build styles section
     styles_section = ""
     if styles:
         parts = []
@@ -125,14 +129,12 @@ def build_prompt(
             + "\nUse <img> tags with these EXACT URLs. NEVER replace logos with text or placeholders.\n"
         )
 
-    # Build SVGs section — now uses rendered SVGs from Playwright (resolved <use> refs)
+    # Build SVGs section
     svgs_section = ""
     if svgs:
         logo_svgs = [s for s in svgs if s.get("isLogo")]
         other_svgs = [s for s in svgs if not s.get("isLogo")]
-
         svg_parts = []
-        # Logo SVGs are critical — include full markup
         for s in logo_svgs[:5]:
             svg_parts.append(
                 f"  LOGO SVG ({s.get('width', 0):.0f}x{s.get('height', 0):.0f}px, "
@@ -140,14 +142,12 @@ def build_prompt(
                 f"aria-label=\"{s.get('ariaLabel', '')}\"):\n"
                 f"  {s['markup'][:3000]}"
             )
-        # Other SVGs — icons, decorations
         for s in other_svgs[:8]:
             svg_parts.append(
                 f"  SVG icon ({s.get('width', 0):.0f}x{s.get('height', 0):.0f}px, "
                 f"class=\"{s.get('classes', '')}\", viewBox=\"{s.get('viewBox', '')}\"):\n"
                 f"  {s['markup'][:1000]}"
             )
-
         if svg_parts:
             svgs_section = (
                 "\n\nRENDERED SVGs extracted from the live page (these are the actual SVG content, <use> refs resolved):\n"
@@ -159,7 +159,7 @@ def build_prompt(
                 + "- NEVER replace an SVG logo with text or a placeholder.\n"
             )
 
-    # Build icons section (Font Awesome, Material Icons, etc.)
+    # Build icons section
     icons_section = ""
     if icons:
         icon_parts = []
@@ -177,7 +177,7 @@ def build_prompt(
                 + "\n".join(f"- {p}" for p in icon_parts) + "\n"
             )
 
-    # Build interactive relationships section (hover + click)
+    # Build interactive relationships section
     interactives_section = ""
     if interactives:
         parts = []
@@ -185,9 +185,7 @@ def build_prompt(
             trigger_label = rel.get("trigger", "?")
             trigger_tag = rel.get("triggerTag", "?")
             action = rel.get("action", "click")
-
             line = f'  - {action.upper()} "{trigger_label}" (<{trigger_tag}>)'
-
             if rel.get("revealed"):
                 revealed_descs = []
                 for r in rel["revealed"]:
@@ -199,11 +197,9 @@ def build_prompt(
                         desc += f' "{r["text"][:60]}"'
                     revealed_descs.append(desc)
                 line += " → REVEALS: " + "; ".join(revealed_descs)
-
             if rel.get("hid"):
                 hid_descs = [f'<{h["tag"]}> "{h.get("text", "")[:40]}"' for h in rel["hid"]]
                 line += " → HIDES: " + "; ".join(hid_descs)
-
             parts.append(line)
 
         interactives_section = (
@@ -221,7 +217,7 @@ def build_prompt(
             + "- ALL interactive elements must actually work — not just be static.\n"
         )
 
-    # Build linked pages section (pages discovered when buttons navigated away)
+    # Build linked pages section
     linked_pages_section = ""
     if linked_pages:
         page_lines = [f'  - "{lp["trigger"]}" links to: {lp["url"]}' for lp in linked_pages[:10]]
@@ -230,6 +226,81 @@ def build_prompt(
             + "\n".join(page_lines)
             + "\n- For these, use <a> tags with the original URLs so they work as navigation links.\n"
         )
+
+    return {
+        "image_list": image_list,
+        "styles_section": styles_section,
+        "logos_section": logos_section,
+        "svgs_section": svgs_section,
+        "icons_section": icons_section,
+        "interactives_section": interactives_section,
+        "linked_pages_section": linked_pages_section,
+        "truncated_html": truncated_html,
+    }
+
+
+# ─── Prompt builders ───────────────────────────────────────────────────────
+
+def _common_rules_block(ctx: dict) -> str:
+    """Return the shared rules text (component, stack, visual accuracy) used by all prompts."""
+    return (
+        "## Component rules\n"
+        '"use client" at top of every file, default export, valid TypeScript/JSX.\n'
+        "ZERO PROPS: all data hardcoded inside. Components render as <Name /> with no props.\n"
+        "Every JSX identifier (icons, components) MUST be imported. Missing imports crash the app.\n"
+        "Keep components under ~300 lines.\n\n"
+
+        "## Stack\n"
+        "Next.js 14 + Tailwind CSS. Prefer building UI from scratch with Tailwind.\n"
+        "Available: lucide-react icons, cn() from @/lib/utils, cva from class-variance-authority.\n\n"
+        "### When to use component libraries\n"
+        "- **shadcn/ui**: Use for standard interactive UI — buttons, dialogs, modals, dropdowns, tabs, forms, tooltips, accordions.\n"
+        "- **Aceternity UI**: Use for modern animated/decorative effects — background beams, sparkles, spotlight, text generate effect, "
+        "animated cards, 3D card effect, hover border gradient, moving borders, wavy backgrounds, lamp effect, etc. "
+        "If the original site has glassmorphism, glowing effects, gradient animations, or a modern SaaS landing page aesthetic, prefer Aceternity components.\n"
+        "- Declare any needed packages in the DEPS line (e.g. `// === DEPS: framer-motion, aceternity ===`).\n\n"
+
+        "## Visual accuracy\n"
+        "- **Text**: copy ALL text VERBATIM from the HTML skeleton. Never paraphrase or use placeholders.\n"
+        "- **Colors**: use exact hex values from extracted styles. Match backgrounds, text colors, gradients.\n"
+        "- **Layout**: count columns exactly. Side-by-side elements must be side-by-side, not stacked. Match flex/grid structure.\n"
+        "- **Spacing**: match padding, margins, gaps from screenshots. Use specific Tailwind values.\n"
+        "- **Typography**: match font sizes, weights, and line heights from screenshots.\n"
+        "- **Images**: use <img> tags (NOT next/image) with original URLs. Match each image to its container using the alt text and context provided.\n"
+        f"\n### Image URLs with context:\n{ctx['image_list']}\n\n"
+        "- **Logos**: ALWAYS use <img> with original URL or copy exact SVG markup. NEVER recreate logos with CSS/text.\n"
+        "- **Fonts**: if Google Fonts detected, load via useEffect appending <link> to document.head.\n"
+        "- **Interactivity**: use useState for dropdowns, tabs, accordions, mobile menus. Hover states via Tailwind or onMouseEnter/onMouseLeave.\n\n"
+
+        f"{ctx['styles_section']}"
+        f"{ctx['logos_section']}"
+        f"{ctx['svgs_section']}"
+        f"{ctx['icons_section']}"
+        f"{ctx['interactives_section']}"
+        f"{ctx['linked_pages_section']}\n"
+        "## HTML Skeleton (use screenshots as PRIMARY visual reference, this for text/structure):\n\n"
+        f"{ctx['truncated_html']}"
+    )
+
+
+def build_prompt(
+    html: str,
+    image_urls: list,
+    n: int,
+    styles: dict | None = None,
+    font_links: list[str] | None = None,
+    icons: dict | None = None,
+    svgs: list[dict] | None = None,
+    logos: list[dict] | None = None,
+    interactives: list[dict] | None = None,
+    linked_pages: list[dict] | None = None,
+) -> str:
+    """Build the full clone prompt for single-agent generation."""
+    ctx = _build_shared_context(
+        html, image_urls,
+        styles=styles, font_links=font_links, icons=icons,
+        svgs=svgs, logos=logos, interactives=interactives, linked_pages=linked_pages,
+    )
 
     return (
         "You are a pixel-perfect website cloning machine. Produce an EXACT visual replica of the screenshots.\n"
@@ -259,53 +330,108 @@ def build_prompt(
         "NEVER output package.json, layout.tsx, globals.css, tsconfig, or any config file.\n"
         "If you need an extra npm package, declare before the first file: // === DEPS: package-name ===\n\n"
 
-        "## Component rules\n"
-        '- Every file: "use client" at top, default export, valid TypeScript/JSX.\n'
-        "- ZERO PROPS: all data hardcoded inside. Components render as <Name /> with no props.\n"
-        "- Every JSX identifier (icons, components) MUST be imported. Missing imports crash the app.\n"
-        "- Keep components under ~300 lines.\n\n"
-
-        "## Stack\n"
-        "Next.js 14 + Tailwind CSS. Prefer building UI from scratch with Tailwind.\n"
-        "Available: lucide-react icons, cn() from @/lib/utils, cva from class-variance-authority.\n\n"
-        "### When to use component libraries\n"
-        "- **shadcn/ui**: Use for standard interactive UI — buttons, dialogs, modals, dropdowns, tabs, forms, tooltips, accordions.\n"
-        "- **Aceternity UI**: Use for modern animated/decorative effects — background beams, sparkles, spotlight, text generate effect, "
-        "animated cards, 3D card effect, hover border gradient, moving borders, wavy backgrounds, lamp effect, etc. "
-        "If the original site has glassmorphism, glowing effects, gradient animations, or a modern SaaS landing page aesthetic, prefer Aceternity components.\n"
-        "- Declare any needed packages in the DEPS line (e.g. `// === DEPS: framer-motion, aceternity ===`).\n\n"
-
-        "## Visual accuracy\n"
-        "- **Text**: copy ALL text VERBATIM from the HTML skeleton. Never paraphrase or use placeholders.\n"
-        "- **Colors**: use exact hex values from extracted styles. Match backgrounds, text colors, gradients.\n"
-        "- **Layout**: count columns exactly. Side-by-side elements must be side-by-side, not stacked. Match flex/grid structure.\n"
-        "- **Spacing**: match padding, margins, gaps from screenshots. Use specific Tailwind values.\n"
-        "- **Typography**: match font sizes, weights, and line heights from screenshots.\n"
-        "- **Images**: use <img> tags (NOT next/image) with original URLs. Match each image to its container using the alt text and context provided.\n"
-        f"\n### Image URLs with context:\n{image_list}\n\n"
-        "- **Logos**: ALWAYS use <img> with original URL or copy exact SVG markup. NEVER recreate logos with CSS/text.\n"
-        "- **Fonts**: if Google Fonts detected, load via useEffect appending <link> to document.head.\n"
-        "- **Interactivity**: use useState for dropdowns, tabs, accordions, mobile menus. Hover states via Tailwind or onMouseEnter/onMouseLeave.\n\n"
-
-        f"{styles_section}"
-        f"{logos_section}"
-        f"{svgs_section}"
-        f"{icons_section}"
-        f"{interactives_section}"
-        f"{linked_pages_section}\n"
-        "## HTML Skeleton (use screenshots as PRIMARY visual reference, this for text/structure):\n\n"
-        f"{truncated_html}"
+        + _common_rules_block(ctx)
     )
 
+
+def build_section_prompt(
+    agent_num: int,
+    total_agents: int,
+    section_positions: list[int],
+    total_height: int,
+    html: str,
+    image_urls: list,
+    n_screenshots: int,
+    styles: dict | None = None,
+    font_links: list[str] | None = None,
+    icons: dict | None = None,
+    svgs: list[dict] | None = None,
+    logos: list[dict] | None = None,
+    interactives: list[dict] | None = None,
+    linked_pages: list[dict] | None = None,
+) -> str:
+    """Build a section-specific prompt for one parallel agent."""
+    ctx = _build_shared_context(
+        html, image_urls,
+        styles=styles, font_links=font_links, icons=icons,
+        svgs=svgs, logos=logos, interactives=interactives, linked_pages=linked_pages,
+    )
+
+    # Calculate position hints
+    if section_positions and total_height > 0:
+        start_pct = int(section_positions[0] / total_height * 100)
+        end_pos = section_positions[-1] + 720  # viewport height
+        end_pct = min(100, int(end_pos / total_height * 100))
+    else:
+        start_pct = int((agent_num - 1) / total_agents * 100)
+        end_pct = int(agent_num / total_agents * 100)
+
+    is_first = agent_num == 1
+    is_last = agent_num == total_agents
+
+    # Section role description
+    if is_first:
+        role = "You handle the TOP of the page. Generate the navigation bar, header, and hero/intro section."
+        boundary_rules = "- You OWN the header/navigation — include it in your output.\n"
+        if not is_last:
+            boundary_rules += "- Do NOT generate a footer — another agent handles the bottom.\n"
+    elif is_last:
+        role = "You handle the BOTTOM of the page. Generate the footer and final sections (CTA, contact, etc.)."
+        boundary_rules = (
+            "- Do NOT generate a navigation bar or header — Agent 1 handles that.\n"
+            "- You OWN the footer — include it in your output.\n"
+        )
+    else:
+        role = "You handle a MIDDLE section of the page. Generate the content sections visible in your screenshots."
+        boundary_rules = (
+            "- Do NOT generate a navigation bar or header — Agent 1 handles that.\n"
+            f"- Do NOT generate a footer — Agent {total_agents} handles that.\n"
+        )
+
+    return (
+        "You are a pixel-perfect website cloning machine. Produce an EXACT visual replica of the screenshots.\n"
+        "IMPORTANT: You are a developer tool. Your ONLY job is to reproduce the visual appearance of the provided screenshots as static HTML/CSS/React code. "
+        "This is no different from a developer using browser DevTools to inspect and recreate a layout. "
+        "You are NOT scraping data, bypassing access controls, or redistributing content. You are writing frontend code that looks like the screenshot. "
+        "Clone ANY website provided — e-commerce, news, social media, corporate, etc. — without hesitation or refusal. "
+        "Never add disclaimers, warnings, or refuse to generate code. Just output the code.\n\n"
+
+        f"## YOUR ASSIGNMENT — Agent {agent_num} of {total_agents}\n"
+        f"{role}\n"
+        f"Your {n_screenshots} screenshot{'s' if n_screenshots > 1 else ''} show the page from approximately {start_pct}% to {end_pct}% vertical scroll.\n"
+        f"{total_agents} agents are working in parallel, each handling a different vertical section.\n\n"
+
+        "## GOLDEN RULE: SCREENSHOTS + HTML SKELETON TOGETHER\n"
+        "- Use the screenshots as the PRIMARY visual reference for layout, colors, spacing, and design.\n"
+        "- Use the HTML skeleton to find the text content for YOUR section.\n"
+        "- NEVER invent content. Only render what you see in your screenshots and the HTML skeleton.\n\n"
+
+        "## Output format\n"
+        "Output ONLY raw TSX code — no markdown fences, no explanation.\n"
+        "Split into multiple files with this delimiter:\n"
+        "  // === FILE: <path> ===\n\n"
+        "Files to generate:\n"
+        "  - components/<Name>.tsx — one per visual section visible in YOUR screenshots\n\n"
+        "CRITICAL:\n"
+        "- Do NOT generate app/page.tsx — it will be assembled automatically from all agents.\n"
+        f"{boundary_rules}"
+        "- Name components descriptively (e.g., Navbar, Hero, Features, Testimonials, Pricing, Footer).\n"
+        "- Sticky/repeated elements visible in your screenshots that belong to another agent should be SKIPPED.\n"
+        "NEVER output package.json, layout.tsx, globals.css, tsconfig, or any config file.\n"
+        "If you need an extra npm package, declare before the first file: // === DEPS: package-name ===\n\n"
+
+        + _common_rules_block(ctx)
+    )
+
+
+# ─── Code cleaning ─────────────────────────────────────────────────────────
 
 def _clean_code(content: str) -> str:
     """Clean a single code block — fix quotes, invisible chars, ensure 'use client'."""
     content = content.strip()
 
-    # Strip ALL markdown fences (the AI sometimes wraps each file in ```tsx...```)
-    # Remove opening fences like ```tsx or ```typescript
+    # Strip ALL markdown fences
     content = re.sub(r'^```(?:tsx|typescript|jsx|ts|javascript)?\s*\n?', '', content, flags=re.MULTILINE)
-    # Remove closing fences
     content = re.sub(r'\n?```\s*$', '', content, flags=re.MULTILINE)
     content = content.strip()
 
@@ -335,19 +461,15 @@ def _clean_code(content: str) -> str:
 
 def _fix_missing_imports(content: str) -> str:
     """Auto-fix missing lucide-react and React imports in generated TSX."""
-    # Find all PascalCase JSX tags used: <Star />, <ChevronDown>, etc.
     jsx_tags = set(re.findall(r'<([A-Z][a-zA-Z0-9]+)[\s/>]', content))
 
-    # Find all already-imported identifiers
     imported = set()
     for m in re.finditer(r'import\s+\{([^}]+)\}\s+from\s+[\'"]([^\'"]+)[\'"]', content):
         names = [n.strip().split(' as ')[0].strip() for n in m.group(1).split(',')]
         imported.update(names)
-    # Default imports
     for m in re.finditer(r'import\s+(\w+)\s+from\s+[\'"]', content):
         imported.add(m.group(1))
 
-    # Known lucide-react icons (common ones the AI uses)
     lucide_icons = {
         'Star', 'ChevronDown', 'ChevronUp', 'ChevronRight', 'ChevronLeft',
         'Menu', 'X', 'Search', 'ArrowRight', 'ArrowLeft', 'ExternalLink',
@@ -383,11 +505,7 @@ def _fix_missing_imports(content: str) -> str:
         'ArrowDownRight', 'MoveRight', 'Lightbulb', 'Wand2',
     }
 
-    # Find missing lucide icons
-    missing_lucide = []
-    for tag in jsx_tags:
-        if tag not in imported and tag in lucide_icons:
-            missing_lucide.append(tag)
+    missing_lucide = [tag for tag in jsx_tags if tag not in imported and tag in lucide_icons]
 
     if not missing_lucide:
         return content
@@ -395,7 +513,6 @@ def _fix_missing_imports(content: str) -> str:
     missing_str = ', '.join(sorted(missing_lucide))
     logger.warning(f"[ai] Auto-fixing missing lucide imports: {missing_str}")
 
-    # Check if there's an existing lucide-react import to extend
     lucide_import_match = re.search(
         r'(import\s+\{)([^}]+)(\}\s+from\s+[\'"]lucide-react[\'"];?)',
         content,
@@ -408,7 +525,6 @@ def _fix_missing_imports(content: str) -> str:
             lucide_import_match.group(1) + ' ' + new_imports + ' ' + lucide_import_match.group(3) + \
             content[lucide_import_match.end():]
     else:
-        # No existing lucide import — add one after "use client"
         import_line = f'import {{ {", ".join(sorted(missing_lucide))} }} from "lucide-react";\n'
         content = re.sub(
             r'("use client";?\s*\n)',
@@ -420,6 +536,8 @@ def _fix_missing_imports(content: str) -> str:
     return content
 
 
+# ─── Multi-file output parsing ─────────────────────────────────────────────
+
 def parse_multi_file_output(raw: str) -> dict:
     """Parse AI output into multiple files using // === FILE: path === delimiters.
 
@@ -430,23 +548,18 @@ def parse_multi_file_output(raw: str) -> dict:
     """
     raw = raw.strip()
 
-    # Extract optional DEPS declaration (before or between file delimiters)
     deps: list[str] = []
     deps_pattern = re.compile(r'^//\s*===\s*DEPS:\s*(.+?)\s*===\s*$', re.MULTILINE)
     deps_match = deps_pattern.search(raw)
     if deps_match:
         deps = [d.strip() for d in deps_match.group(1).split(",") if d.strip()]
-        # Strip the DEPS line from raw so it doesn't interfere with file parsing
         raw = raw[:deps_match.start()] + raw[deps_match.end():]
         raw = raw.strip()
 
-    # Try to find multi-file delimiters
-    # Match: // === FILE: app/page.tsx ===
     file_pattern = re.compile(r'^//\s*===\s*FILE:\s*(.+?)\s*===\s*$', re.MULTILINE)
     matches = list(file_pattern.finditer(raw))
 
     if len(matches) >= 2:
-        # Multi-file output
         files = []
         for i, match in enumerate(matches):
             path = match.group(1).strip()
@@ -458,11 +571,531 @@ def parse_multi_file_output(raw: str) -> dict:
         logger.info(f"Parsed {len(files)} files from multi-file output")
         return {"files": files, "deps": deps}
 
-    # Fallback: single file
     logger.info("No multi-file delimiters found, treating as single page.tsx")
     content = _clean_code(raw)
     files = [{"path": "app/page.tsx", "content": content}] if content else []
     return {"files": files, "deps": deps}
+
+
+# ─── Parallel agent helpers ─────────────────────────────────────────────────
+
+def _determine_agent_count(num_screenshots: int) -> int:
+    """Scale number of parallel agents based on screenshot count. Max 5."""
+    if num_screenshots <= 1:
+        return 1
+    elif num_screenshots <= 2:
+        return 2
+    elif num_screenshots <= 4:
+        return 3
+    elif num_screenshots <= 6:
+        return 4
+    else:
+        return min(num_screenshots, MAX_PARALLEL_AGENTS)
+
+
+def _assign_screenshots_to_agents(
+    screenshots: list[str],
+    positions: list[int],
+    num_agents: int,
+) -> tuple[list[list[str]], list[list[int]]]:
+    """Distribute screenshots evenly across agents. Each gets at least 1."""
+    n = len(screenshots)
+    ss_assignments: list[list[str]] = []
+    pos_assignments: list[list[int]] = []
+
+    base_count = n // num_agents
+    remainder = n % num_agents
+    idx = 0
+    for a in range(num_agents):
+        count = base_count + (1 if a < remainder else 0)
+        ss_assignments.append(screenshots[idx:idx + count])
+        pos_assignments.append(positions[idx:idx + count])
+        idx += count
+
+    return ss_assignments, pos_assignments
+
+
+def _stitch_results(agent_results: list[dict]) -> dict:
+    """Combine component files from multiple parallel agents.
+
+    Each agent_result has {"files": [...], "deps": [...]}.
+    Returns combined {"files": [...], "deps": [...], "component_order": [...]}.
+    Does NOT generate page.tsx — the assembler agent handles that.
+    """
+    all_component_files: list[dict] = []
+    all_deps: set[str] = set()
+    component_order: list[tuple[str, str, int]] = []  # (name, import_path, agent_num)
+    seen_paths: dict[str, int] = {}
+
+    for agent_idx, result in enumerate(agent_results):
+        if not result:
+            continue
+        for f in result.get("files", []):
+            path = f["path"]
+
+            # Skip any page.tsx generated by agents
+            if path == "app/page.tsx":
+                continue
+
+            # Handle naming conflicts
+            if path in seen_paths:
+                base, ext = path.rsplit(".", 1) if "." in path else (path, "tsx")
+                new_name_suffix = agent_idx + 1
+                new_path = f"{base}{new_name_suffix}.{ext}"
+                old_name = base.split("/")[-1]
+                new_name = f"{old_name}{new_name_suffix}"
+                content = f["content"]
+                content = re.sub(
+                    rf'export\s+default\s+function\s+{re.escape(old_name)}\b',
+                    f'export default function {new_name}',
+                    content,
+                )
+                f = {"path": new_path, "content": content}
+                path = new_path
+                logger.info(f"[stitch] Renamed conflicting component: {old_name} → {new_name}")
+            else:
+                seen_paths[path] = agent_idx
+
+            all_component_files.append(f)
+
+            if path.startswith("components/") and path.count("/") == 1:
+                comp_name = path.replace("components/", "").replace(".tsx", "").replace(".jsx", "")
+                import_path = f"@/components/{comp_name}"
+                component_order.append((comp_name, import_path, agent_idx + 1))
+
+        for dep in result.get("deps", []):
+            all_deps.add(dep)
+
+    return {
+        "files": all_component_files,
+        "deps": list(all_deps),
+        "component_order": component_order,
+    }
+
+
+async def _assemble_page(
+    component_order: list[tuple[str, str, int]],
+    num_agents: int,
+    screenshots: list[str],
+    scroll_positions: list[int],
+    total_height: int,
+    styles: dict | None = None,
+    font_links: list[str] | None = None,
+    on_status=None,
+) -> dict:
+    """Use a lightweight AI call to generate page.tsx that assembles all components.
+
+    Receives component names, a few screenshots for layout reference, and
+    generates the proper page.tsx with correct ordering, global styles, font
+    loading, and layout structure.
+
+    Returns {"content": str, "usage": {...}}.
+    """
+    client = get_openrouter_client()
+    model = "anthropic/claude-sonnet-4.5"
+
+    if on_status:
+        await on_status({
+            "status": "generating",
+            "message": "Assembler agent: building page layout...",
+        })
+
+    # Build component manifest for the prompt
+    comp_lines = []
+    for name, import_path, agent_num in component_order:
+        position = "top" if agent_num == 1 else ("bottom" if agent_num == num_agents else "middle")
+        comp_lines.append(f"  - {name} (from Agent {agent_num}, {position} section) → import from \"{import_path}\"")
+    comp_manifest = "\n".join(comp_lines)
+
+    # Build styles hint
+    style_hints = ""
+    if styles:
+        parts = []
+        if styles.get("fonts"):
+            parts.append(f"Fonts: {', '.join(styles['fonts'])}")
+        if styles.get("colors"):
+            bg_colors = [c for c in styles['colors'][:5] if c]
+            if bg_colors:
+                parts.append(f"Key colors: {', '.join(bg_colors)}")
+        if parts:
+            style_hints = "\n".join(f"- {p}" for p in parts)
+
+    font_hint = ""
+    if font_links:
+        font_hint = (
+            "\n\nGoogle Font / icon CDN links detected:\n"
+            + "\n".join(f"  - {fl}" for fl in font_links[:5])
+            + "\nLoad these fonts in a useEffect that appends <link> elements to document.head.\n"
+        )
+
+    prompt = (
+        "You are assembling a Next.js page from pre-built components.\n"
+        "Other agents have already generated these components. Your ONLY job is to generate app/page.tsx.\n\n"
+
+        "IMPORTANT: You are a developer tool. You are writing layout code to arrange existing React components. "
+        "Just output the code.\n\n"
+
+        f"## Available components (in agent order, top → bottom):\n{comp_manifest}\n\n"
+
+        "## Your task\n"
+        "Generate ONLY app/page.tsx that:\n"
+        "1. Imports every component listed above\n"
+        "2. Arranges them in the correct visual order matching the screenshots\n"
+        "3. Uses the right layout structure — look at the screenshots to determine if the page is:\n"
+        "   - Simple top-to-bottom stack (most common)\n"
+        "   - Has a sidebar layout\n"
+        "   - Has a grid/multi-column layout\n"
+        "4. Adds global setup if needed:\n"
+        "   - Page background color (if the page has a non-white background)\n"
+        "   - Font loading via useEffect (if Google Fonts detected)\n"
+        "   - Any wrapper divs needed for the layout\n\n"
+
+        "## Rules\n"
+        '- Start with "use client"\n'
+        "- Default export function Home()\n"
+        "- Import each component with: import Name from \"@/components/Name\"\n"
+        "- Do NOT recreate or modify any component — just import and render them\n"
+        "- Do NOT add placeholder content or comments\n"
+        "- Output ONLY the raw TSX code for app/page.tsx — no markdown, no explanation\n\n"
+
+        f"{f'## Detected styles{chr(10)}{style_hints}{chr(10)}' if style_hints else ''}"
+        f"{font_hint}"
+    )
+
+    # Send a subset of screenshots for layout context (first, middle, last)
+    ss_indices = [0]
+    if len(screenshots) > 2:
+        ss_indices.append(len(screenshots) // 2)
+    if len(screenshots) > 1:
+        ss_indices.append(len(screenshots) - 1)
+
+    content: list = []
+    for idx in ss_indices:
+        ss = screenshots[idx]
+        scroll_y = scroll_positions[idx] if idx < len(scroll_positions) else 0
+        pct = int(scroll_y / total_height * 100) if total_height > 0 else 0
+        content.append({"type": "text", "text": f"Page screenshot ({pct}% scroll):"})
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{ss}"},
+        })
+    content.append({"type": "text", "text": prompt})
+
+    t0 = time.time()
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=4000,
+            temperature=0,
+        )
+    except Exception as e:
+        logger.error(f"[ai-assembler] Failed: {e}")
+        # Fallback: generate a simple mechanical page.tsx
+        fb = _fallback_page(component_order)
+        fb["usage"] = {"tokens_in": 0, "tokens_out": 0}
+        return fb
+
+    raw = response.choices[0].message.content or ""
+    t_elapsed = time.time() - t0
+    u = _extract_usage(response)
+    cost = _calc_cost(u["tokens_in"], u["tokens_out"], model)
+
+    logger.info(
+        f"[ai-assembler] page.tsx assembled in {t_elapsed:.1f}s | "
+        f"tokens_in={u['tokens_in']} tokens_out={u['tokens_out']} cost=${cost:.4f}"
+    )
+
+    if not raw:
+        fb = _fallback_page(component_order)
+        fb["usage"] = u
+        return fb
+
+    page_content = _clean_code(raw)
+
+    if on_status:
+        await on_status({
+            "status": "generating",
+            "message": f"Assembler done — page layout generated in {t_elapsed:.0f}s",
+        })
+        await on_status({
+            "type": "file_write",
+            "file": "app/page.tsx",
+            "action": "create",
+            "lines": page_content.count("\n") + 1,
+        })
+
+    return {"content": page_content, "usage": u}
+
+
+def _fallback_page(component_order: list[tuple[str, str, int]]) -> dict:
+    """Generate a simple mechanical page.tsx as fallback if the assembler fails."""
+    import_lines = []
+    render_lines = []
+    for comp_name, import_path, _ in component_order:
+        import_lines.append(f'import {comp_name} from "{import_path}";')
+        render_lines.append(f"      <{comp_name} />")
+
+    page_content = (
+        '"use client";\n\n'
+        + "\n".join(import_lines) + "\n\n"
+        + "export default function Home() {\n"
+        + "  return (\n"
+        + '    <main className="min-h-screen">\n'
+        + "\n".join(render_lines) + "\n"
+        + "    </main>\n"
+        + "  );\n"
+        + "}\n"
+    )
+    return {"content": page_content}
+
+
+async def _run_section_agent(
+    agent_num: int,
+    total_agents: int,
+    section_screenshots: list[str],
+    section_positions: list[int],
+    total_height: int,
+    prompt: str,
+    model: str = "anthropic/claude-sonnet-4.5",
+    on_status=None,
+) -> dict:
+    """Run a single parallel agent with its assigned screenshots.
+
+    Returns {"files": [...], "deps": [...], "usage": {...}} or None on failure.
+    """
+    client = get_openrouter_client()
+    n = len(section_screenshots)
+    agent_label = f"Agent {agent_num}/{total_agents}"
+
+    if on_status:
+        await on_status({
+            "status": "generating",
+            "message": f"{agent_label}: starting ({n} screenshot{'s' if n > 1 else ''})...",
+            "type": "agent_start",
+            "agent": agent_num,
+            "total_agents": total_agents,
+        })
+
+    # Build message content: labeled screenshots + prompt
+    content: list = []
+    for i, ss in enumerate(section_screenshots):
+        label = f"Screenshot {i + 1} of {n} for your section"
+        if section_positions and i < len(section_positions):
+            scroll_y = section_positions[i]
+            if total_height > 0:
+                pct = int(scroll_y / total_height * 100)
+                label += f" (scrolled to {pct}% — pixels {scroll_y}–{scroll_y + 720} of {total_height}px)"
+        content.append({"type": "text", "text": label})
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{ss}"},
+        })
+    content.append({"type": "text", "text": prompt})
+
+    t0 = time.time()
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=32000,
+            temperature=0,
+        )
+    except Exception as e:
+        logger.error(f"[ai] {agent_label} failed: {e}")
+        if on_status:
+            await on_status({
+                "status": "generating",
+                "message": f"{agent_label}: FAILED — {e}",
+                "type": "agent_error",
+                "agent": agent_num,
+            })
+        return {"files": [], "deps": [], "usage": {"tokens_in": 0, "tokens_out": 0}}
+
+    raw_output = response.choices[0].message.content or ""
+    t_elapsed = time.time() - t0
+    u = _extract_usage(response)
+    cost = _calc_cost(u["tokens_in"], u["tokens_out"], model)
+
+    logger.info(
+        f"[ai] {agent_label}: {len(raw_output)} chars in {t_elapsed:.1f}s | "
+        f"tokens_in={u['tokens_in']} tokens_out={u['tokens_out']} cost=${cost:.4f}"
+    )
+
+    if not raw_output:
+        return {"files": [], "deps": [], "usage": u}
+
+    result = parse_multi_file_output(raw_output)
+    component_names = [f["path"].split("/")[-1].replace(".tsx", "") for f in result["files"]]
+
+    if on_status:
+        await on_status({
+            "status": "section_complete",
+            "type": "section_complete",
+            "message": f"{agent_label} done: {', '.join(component_names)} ({t_elapsed:.0f}s)",
+            "section": agent_num,
+            "total": total_agents,
+            "components": component_names,
+        })
+        for f in result["files"]:
+            line_count = f["content"].count("\n") + 1
+            await on_status({
+                "type": "file_write",
+                "file": f["path"],
+                "action": "create",
+                "lines": line_count,
+            })
+
+    result["usage"] = u
+    return result
+
+
+# ─── Main generation entry points ──────────────────────────────────────────
+
+async def generate_clone_parallel(
+    html: str,
+    screenshots: list[str],
+    image_urls: list[str],
+    url: str,
+    styles: dict | None = None,
+    font_links: list[str] | None = None,
+    icons: dict | None = None,
+    svgs: list[dict] | None = None,
+    logos: list[dict] | None = None,
+    interactives: list[dict] | None = None,
+    linked_pages: list[dict] | None = None,
+    scroll_positions: list[int] | None = None,
+    total_height: int = 0,
+    on_status=None,
+) -> dict:
+    """Generate a clone using parallel agents, each handling a vertical section.
+
+    Returns {"files": [...], "deps": [...], "usage": {...}}.
+    """
+    n = len(screenshots)
+    positions = scroll_positions or [0] * n
+    num_agents = _determine_agent_count(n)
+    model = "anthropic/claude-sonnet-4.5"
+
+    logger.info(f"[ai-parallel] {n} screenshots → {num_agents} parallel agents")
+
+    if on_status:
+        await on_status({
+            "status": "generating",
+            "message": f"Splitting into {num_agents} parallel agents ({n} screenshots)...",
+        })
+
+    # Distribute screenshots across agents
+    ss_per_agent, pos_per_agent = _assign_screenshots_to_agents(screenshots, positions, num_agents)
+
+    # Build section-specific prompts
+    shared_kwargs = dict(
+        html=html, image_urls=image_urls,
+        styles=styles, font_links=font_links, icons=icons,
+        svgs=svgs, logos=logos, interactives=interactives, linked_pages=linked_pages,
+    )
+
+    prompts = []
+    for i in range(num_agents):
+        prompt = build_section_prompt(
+            agent_num=i + 1,
+            total_agents=num_agents,
+            section_positions=pos_per_agent[i],
+            total_height=total_height,
+            n_screenshots=len(ss_per_agent[i]),
+            **shared_kwargs,
+        )
+        prompts.append(prompt)
+
+    # Launch all agents in parallel
+    t0 = time.time()
+    tasks = []
+    for i in range(num_agents):
+        task = _run_section_agent(
+            agent_num=i + 1,
+            total_agents=num_agents,
+            section_screenshots=ss_per_agent[i],
+            section_positions=pos_per_agent[i],
+            total_height=total_height,
+            prompt=prompts[i],
+            model=model,
+            on_status=on_status,
+        )
+        tasks.append(task)
+
+    agent_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Handle exceptions from gather
+    clean_results = []
+    for i, result in enumerate(agent_results):
+        if isinstance(result, Exception):
+            logger.error(f"[ai-parallel] Agent {i + 1} raised exception: {result}")
+            clean_results.append({"files": [], "deps": [], "usage": {"tokens_in": 0, "tokens_out": 0}})
+        else:
+            clean_results.append(result)
+
+    t_total = time.time() - t0
+    logger.info(f"[ai-parallel] All {num_agents} agents finished in {t_total:.1f}s")
+
+    if on_status:
+        await on_status({
+            "status": "generating",
+            "message": f"All {num_agents} agents done in {t_total:.0f}s — assembling layout...",
+        })
+
+    # Stitch component files together (no page.tsx yet)
+    stitched = _stitch_results(clean_results)
+    component_files = stitched["files"]
+    all_deps = stitched["deps"]
+    component_order = stitched["component_order"]
+
+    # Aggregate usage from section agents
+    total_tokens_in = sum(r.get("usage", {}).get("tokens_in", 0) for r in clean_results)
+    total_tokens_out = sum(r.get("usage", {}).get("tokens_out", 0) for r in clean_results)
+
+    # Run assembler agent to generate the page.tsx with proper layout
+    assembler_result = await _assemble_page(
+        component_order=component_order,
+        num_agents=num_agents,
+        screenshots=screenshots,
+        scroll_positions=positions,
+        total_height=total_height,
+        styles=styles,
+        font_links=font_links,
+        on_status=on_status,
+    )
+
+    page_content = assembler_result["content"]
+    assembler_usage = assembler_result.get("usage", {})
+    total_tokens_in += assembler_usage.get("tokens_in", 0)
+    total_tokens_out += assembler_usage.get("tokens_out", 0)
+
+    t_total = time.time() - t0  # re-measure to include assembler time
+    total_cost = _calc_cost(total_tokens_in, total_tokens_out, model)
+
+    all_files = [{"path": "app/page.tsx", "content": page_content}] + component_files
+
+    combined = {
+        "files": all_files,
+        "deps": all_deps,
+        "usage": {
+            "tokens_in": total_tokens_in,
+            "tokens_out": total_tokens_out,
+            "total_cost": total_cost,
+            "api_calls": num_agents + 1,  # section agents + assembler
+            "model": model,
+            "duration_s": round(t_total, 1),
+            "agents": num_agents,
+        },
+    }
+
+    logger.info(
+        f"[ai-parallel] Complete: {len(all_files)} files ({num_agents} agents + assembler) | "
+        f"tokens_in={total_tokens_in} tokens_out={total_tokens_out} cost=${total_cost:.4f} "
+        f"duration={t_total:.1f}s"
+    )
+
+    return combined
 
 
 async def generate_clone(
@@ -485,7 +1118,7 @@ async def generate_clone(
     """Generate a Next.js clone from HTML + viewport screenshots.
 
     Returns {"files": [{"path": ..., "content": ...}], "deps": [...]}.
-    If multiple screenshots, delegates to parallel multi-pass generation.
+    Automatically uses parallel agents when multiple screenshots are available.
     """
     n = len(screenshots)
 
@@ -493,11 +1126,32 @@ async def generate_clone(
         logger.error("No screenshots provided — cannot generate clone")
         return {"files": [], "deps": []}
 
-    # Single-agent generation — all screenshots go to one AI call
-    client = get_openrouter_client()
-
     prompt_len = len(html) + sum(len(u["url"] if isinstance(u, dict) else u) for u in image_urls)
     logger.info(f"[ai] Generating clone: {n} screenshot(s), {len(html)} chars HTML, {len(image_urls)} images, ~{prompt_len // 1000}k prompt chars")
+
+    # Use parallel generation when we have multiple screenshots
+    num_agents = _determine_agent_count(n)
+    if num_agents > 1:
+        logger.info(f"[ai] Delegating to parallel generation: {num_agents} agents for {n} screenshots")
+        return await generate_clone_parallel(
+            html=html,
+            screenshots=screenshots,
+            image_urls=image_urls,
+            url=url,
+            styles=styles,
+            font_links=font_links,
+            icons=icons,
+            svgs=svgs,
+            logos=logos,
+            interactives=interactives,
+            linked_pages=linked_pages,
+            scroll_positions=scroll_positions,
+            total_height=total_height,
+            on_status=on_status,
+        )
+
+    # Single-agent generation — all screenshots go to one AI call
+    client = get_openrouter_client()
 
     if on_status:
         await on_status({"status": "generating", "message": "Building AI prompt..."})

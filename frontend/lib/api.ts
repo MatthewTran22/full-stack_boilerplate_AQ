@@ -88,6 +88,7 @@ export interface CloneUsage {
   api_calls: number;
   model: string;
   duration_s: number;
+  agents?: number;
 }
 
 export interface CloneEvent {
@@ -106,10 +107,12 @@ export interface CloneEvent {
   // screenshot event
   screenshot?: string;
   screenshots?: string[];
-  // section_complete event fields
+  // section_complete / agent progress event fields
   section?: number;
   total?: number;
   components?: string[];
+  agent?: number;
+  total_agents?: number;
 }
 
 // 5 minute timeout for the entire SSE stream

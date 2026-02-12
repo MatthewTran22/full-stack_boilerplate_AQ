@@ -372,9 +372,15 @@ export default function Home() {
           addMessageLog(getIconForStatus(data.status, data.message || ""), data.message || "");
         } else if (data.status === "generating") {
           setStatus("generating");
-          // Detect section count from message like "AI is generating the clone (3 sections)..."
+          // Detect agent/section count from messages like:
+          // "Splitting into 3 parallel agents (5 screenshots)..."
+          // "AI is generating the clone (3 sections)..."
+          const agentMatch = (data.message || "").match(/(\d+)\s+parallel\s+agents?/);
           const sectionMatch = (data.message || "").match(/\((\d+)\s+sections?\)/);
-          if (sectionMatch) setSectionTotal(parseInt(sectionMatch[1], 10));
+          if (agentMatch) setSectionTotal(parseInt(agentMatch[1], 10));
+          else if (sectionMatch) setSectionTotal(parseInt(sectionMatch[1], 10));
+          // Also detect from agent_start events
+          if (data.total_agents && data.total_agents > 0) setSectionTotal(data.total_agents);
           addMessageLog(getIconForStatus(data.status, data.message || ""), data.message || "");
         } else if (data.status === "section_complete") {
           const sec = data.section || 0;

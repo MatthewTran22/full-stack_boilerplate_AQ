@@ -608,13 +608,21 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                         names = ", ".join(event.get("components", []))
                         sec = event.get("section", "?")
                         tot = event.get("total", "?")
-                        msg = f"Section {sec}/{tot} complete ({names})" if names else f"Section {sec}/{tot} complete"
+                        msg = event.get("message") or (f"Agent {sec}/{tot} done ({names})" if names else f"Agent {sec}/{tot} done")
                         yield sse_event({
                             "status": "section_complete",
                             "message": msg,
                             "section": sec,
                             "total": tot,
                             "components": event.get("components", []),
+                        })
+                    elif evt_type == "agent_start":
+                        yield sse_event({
+                            "status": "generating",
+                            "message": event.get("message", ""),
+                            "type": "agent_start",
+                            "agent": event.get("agent"),
+                            "total_agents": event.get("total_agents"),
                         })
                     elif evt_type == "file_write":
                         yield sse_event({

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 MAX_SCREENSHOT_DIM = 7000
 VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 720
-MAX_SCREENSHOTS = 5  # Cap parallel AI calls; screenshots are evenly spaced if page is tall
+MAX_SCREENSHOTS = 8  # Cap screenshots for parallel AI agents; evenly spaced for tall pages
 
 
 # JS to extract computed styles, fonts, colors from the live page
@@ -736,8 +736,8 @@ async def scrape_and_capture(url: str, on_status=None) -> dict:
         scroll_positions = []
         region_types = []
         viewports_needed = max(1, -(-total_height // VIEWPORT_HEIGHT))  # ceil division
-        # Single-agent mode: cap at 3 screenshots to keep payload manageable
-        num_screenshots = min(viewports_needed, 3)
+        # Parallel mode: take more screenshots so agents each get 1-2
+        num_screenshots = min(viewports_needed, MAX_SCREENSHOTS)
         logger.info(f"Page needs {viewports_needed} viewports → using {num_screenshots} screenshots")
         # Stride: for short pages use viewport height (no gaps),
         # for tall pages space evenly so all sections are captured
