@@ -2,7 +2,7 @@
 
 An AI-powered website cloning tool. Enter a URL, and it scrapes, screenshots, and uses AI to generate a standalone HTML/CSS clone displayed in a live preview.
 
-**Deployed project:** `<ADD_DEPLOYED_LINK>`
+**Deployed project:** https://clonr-two.vercel.app/
 
 **Demo video:** `<ADD_VIDEO_LINK>`
 
