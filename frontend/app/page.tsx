@@ -89,7 +89,7 @@ const fadeIn = {
 
 type CloneStatus = "idle" | "scraping" | "generating" | "deploying" | "done" | "error";
 
-type LogEntry = MessageLogEntry | FileLogEntry | ScreenshotLogEntry | SectionLogEntry;
+type LogEntry = MessageLogEntry | FileLogEntry | ScreenshotLogEntry | SectionLogEntry | UploadLogEntry;
 
 interface MessageLogEntry {
   kind: "message";
@@ -121,6 +121,13 @@ interface SectionLogEntry {
   section: number;
   total: number;
   components: string[];
+  timestamp: Date;
+}
+
+interface UploadLogEntry {
+  kind: "upload";
+  id: number;
+  file: string;
   timestamp: Date;
 }
 
@@ -264,7 +271,12 @@ export default function Home() {
           }
           addMessageLog("camera", "Screenshot captured", "done");
         } else if (data.status === "file_upload") {
-          addMessageLog("rocket", data.message || "Uploading file...");
+          const uploadFile = data.file || (data.message || "").replace(/^Uploaded\s+/, "");
+          const uid = ++logIdRef.current;
+          setLogEntries((prev) => [
+            ...prev,
+            { kind: "upload" as const, id: uid, file: uploadFile, timestamp: new Date() },
+          ]);
         } else if (data.status === "sandbox_ready") {
           if (data.preview_url) setPreviewUrl(resolveApiUrl(data.preview_url));
           addMessageLog("rocket", "Sandbox ready — loading preview...", "done");
@@ -697,6 +709,7 @@ export default function Home() {
                   else if (entry.kind === "file") phaseKey = "generate";
                   else if (entry.kind === "screenshot") phaseKey = "scrape";
                   else if (entry.kind === "section") phaseKey = "generate";
+                  else if (entry.kind === "upload") phaseKey = "deploy";
 
                   if (!current || current.id !== phaseKey) {
                     current = {
@@ -716,10 +729,12 @@ export default function Home() {
                   const files = phase.entries.filter((e): e is FileLogEntry => e.kind === "file");
                   const screenshots = phase.entries.filter((e): e is ScreenshotLogEntry => e.kind === "screenshot");
                   const sections = phase.entries.filter((e): e is SectionLogEntry => e.kind === "section");
+                  const uploads = phase.entries.filter((e): e is UploadLogEntry => e.kind === "upload");
                   const parts: string[] = [];
                   if (screenshots.length) parts.push(`${screenshots.length} screenshot${screenshots.length > 1 ? "s" : ""}`);
                   if (sections.length > 0) parts.push(`${sections.length} agent${sections.length > 1 ? "s" : ""}`);
                   if (files.length) { const totalLines = files.reduce((s, f) => s + f.lines, 0); parts.push(`${files.length} files · ${totalLines} lines`); }
+                  if (uploads.length > 0) parts.push(`${uploads.length} file${uploads.length > 1 ? "s" : ""} uploaded`);
                   if (parts.length) phase.summary = parts.join(" · ");
                 }
 
@@ -801,8 +816,8 @@ export default function Home() {
                           </div>
                         )}
 
-                        {/* Active state: show elapsed or parallel agents */}
-                        {isActive && phase.id !== "generate" && (
+                        {/* Active state: generic spinner for non-generate/non-deploy phases */}
+                        {isActive && phase.id !== "generate" && phase.id !== "deploy" && phase.id !== "fix" && (
                           <div className="mt-1.5 ml-[22px] flex items-center gap-2">
                             <div className="w-1 h-1 rounded-full bg-primary/60 animate-pulse" />
                             <span className="text-[10px] text-muted-foreground/40 font-mono">
@@ -885,6 +900,105 @@ export default function Home() {
                             </span>
                           </div>
                         )}
+
+                        {/* ── Deploy phase: step checklist with file uploads ── */}
+                        {(phase.id === "deploy" || phase.id === "fix") && (() => {
+                          const msgs = phase.entries.filter((e): e is MessageLogEntry => e.kind === "message");
+                          const uploadEntries = phase.entries.filter((e): e is UploadLogEntry => e.kind === "upload");
+                          const totalFilesToUpload = generatedFiles.length || uploadEntries.length;
+
+                          // Derive deploy steps from messages
+                          type DeployStep = { label: string; done: boolean; active: boolean; icon: "rocket" | "wrench" };
+                          const steps: DeployStep[] = [];
+                          const msgTexts = msgs.map((m) => m.message.toLowerCase());
+
+                          const hasSandboxWait = msgTexts.some((m) => m.includes("waiting for sandbox") || m.includes("creating sandbox"));
+                          const hasUpload = uploadEntries.length > 0 || msgTexts.some((m) => m.includes("uploading"));
+                          const hasPreview = msgTexts.some((m) => m.includes("preview") || m.includes("dev server"));
+                          const hasFix = msgs.some((m) => m.icon === "wrench") || phase.id === "fix";
+
+                          if (hasSandboxWait || isActive) {
+                            steps.push({
+                              label: "Creating sandbox",
+                              done: hasUpload || hasPreview,
+                              active: !hasUpload && !hasPreview && isActive,
+                              icon: "rocket",
+                            });
+                          }
+                          if (hasUpload || isActive) {
+                            steps.push({
+                              label: `Uploading files${totalFilesToUpload > 0 ? ` (${uploadEntries.length}/${totalFilesToUpload})` : ""}`,
+                              done: uploadEntries.length >= totalFilesToUpload && uploadEntries.length > 0,
+                              active: uploadEntries.length > 0 && uploadEntries.length < totalFilesToUpload && isActive,
+                              icon: "rocket",
+                            });
+                          }
+                          if (hasFix) {
+                            steps.push({
+                              label: "Auto-fixing errors",
+                              done: msgs.some((m) => m.status === "done" && m.icon === "wrench"),
+                              active: msgs.some((m) => m.status === "active" && m.icon === "wrench"),
+                              icon: "wrench",
+                            });
+                          }
+                          if (hasPreview || (hasUpload && uploadEntries.length >= totalFilesToUpload)) {
+                            steps.push({
+                              label: "Starting preview",
+                              done: msgTexts.some((m) => m.includes("sandbox ready")),
+                              active: !msgTexts.some((m) => m.includes("sandbox ready")) && isActive,
+                              icon: "rocket",
+                            });
+                          }
+
+                          // If no steps detected yet but phase is active, show generic
+                          if (steps.length === 0 && isActive) {
+                            steps.push({ label: "Preparing deployment", done: false, active: true, icon: "rocket" });
+                          }
+
+                          return (
+                            <div className="mt-2.5 ml-[22px] space-y-0.5">
+                              {/* Step checklist */}
+                              {steps.map((step, si) => (
+                                <div key={si} className="flex items-center gap-2 py-1">
+                                  {step.done ? (
+                                    <CheckCircle2 className="w-3 h-3 text-emerald-500/60 shrink-0" />
+                                  ) : step.active ? (
+                                    <Loader2 className="w-3 h-3 text-primary animate-spin shrink-0" />
+                                  ) : (
+                                    <div className="w-3 h-3 rounded-full border border-[hsl(0,0%,20%)] shrink-0" />
+                                  )}
+                                  <span className={`text-[11px] font-mono ${step.done ? "text-muted-foreground/50" : step.active ? "text-foreground/80" : "text-muted-foreground/30"}`}>
+                                    {step.label}
+                                  </span>
+                                </div>
+                              ))}
+
+                              {/* File upload progress bar */}
+                              {uploadEntries.length > 0 && totalFilesToUpload > 0 && (
+                                <div className="pt-1.5">
+                                  <div className="h-1 rounded-full bg-white/[0.04] overflow-hidden">
+                                    <div
+                                      className="h-full rounded-full bg-gradient-to-r from-primary/40 to-primary/60 transition-all duration-500 ease-out"
+                                      style={{ width: `${Math.min(100, (uploadEntries.length / totalFilesToUpload) * 100)}%` }}
+                                    />
+                                  </div>
+                                  {/* Uploaded file names */}
+                                  <div className="mt-1.5 space-y-px">
+                                    {uploadEntries.slice(-5).map((u) => (
+                                      <div key={u.id} className="flex items-center gap-1.5 py-0.5">
+                                        <CheckCircle2 className="w-2 h-2 text-emerald-500/40 shrink-0" />
+                                        <span className="text-[9px] font-mono text-muted-foreground/40 truncate">{u.file}</span>
+                                      </div>
+                                    ))}
+                                    {uploadEntries.length > 5 && (
+                                      <span className="text-[9px] font-mono text-muted-foreground/25 pl-3.5">+{uploadEntries.length - 5} more</span>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
 
                         {/* Expanded details */}
                         {isOpen && !isDone && (
