@@ -198,7 +198,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    getClones(clonePage, 30).then((res) => {
+    getClones(clonePage, 5).then((res) => {
       setHistory(res.items);
       setClonePages(res.pages);
       setCloneTotal(res.total);
@@ -352,7 +352,7 @@ export default function Home() {
             setExpandedFolders(folders);
           }
           if (data.preview_url) setPreviewUrl(resolveApiUrl(data.preview_url));
-          getClones(1, 30).then((res) => { setHistory(res.items); setClonePages(res.pages); setCloneTotal(res.total); setClonePage(1); }).catch(() => {});
+          getClones(1, 5).then((res) => { setHistory(res.items); setClonePages(res.pages); setCloneTotal(res.total); setClonePage(1); }).catch(() => {});
         } else if (data.status === "error") {
           setStatus("error");
           setError(data.message || "Unknown error");
@@ -647,47 +647,60 @@ export default function Home() {
             </motion.p>
           </motion.form>
 
-          {/* History */}
+          {/* History — list style like v0/bolt */}
           {history.length > 0 && (
-            <motion.div variants={fadeUp} className="mt-16 w-full max-w-5xl">
-              <div className="flex items-center justify-between mb-5">
-                <p className="text-[11px] font-mono text-muted-foreground/60 uppercase tracking-[0.15em] flex items-center gap-2">
+            <motion.div variants={fadeUp} className="mt-14 w-full max-w-2xl">
+              <div className="flex items-center justify-between mb-3 px-1">
+                <p className="text-[11px] font-mono text-muted-foreground/50 uppercase tracking-[0.15em] flex items-center gap-2">
                   <Clock className="w-3 h-3" />
                   Recent clones
-                  {cloneTotal > 0 && <span className="text-muted-foreground/30">{cloneTotal}</span>}
+                  {cloneTotal > 0 && <span className="text-muted-foreground/25">{cloneTotal}</span>}
                 </p>
               </div>
-              <motion.div
-                variants={stagger}
-                initial="hidden"
-                animate="visible"
-                className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5"
-              >
-                {history.map((item) => {
+              <div className="rounded-xl border border-[hsl(0,0%,14%)] bg-[hsl(0,0%,9%)]/80 backdrop-blur-sm overflow-hidden divide-y divide-[hsl(0,0%,13%)]">
+                {history.map((item, i) => {
                   const domain = item.url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+                  const path = item.url.replace(/^https?:\/\//, "").replace(/^[^/]*/, "").replace(/\/$/, "") || "/";
                   return (
                     <motion.button
                       key={item.id}
-                      variants={fadeUp}
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.3, delay: i * 0.03, ease: [0.16, 1, 0.3, 1] }}
                       onClick={() => handleHistoryClick(item)}
-                      className="gradient-card group text-left"
+                      className="w-full flex items-center gap-3 px-4 py-3 text-left group hover:bg-white/[0.03] transition-colors duration-200"
                     >
-                      <div className="relative z-10 p-4 bg-[hsl(0,0%,10%)] rounded-[inherit]">
-                        <div className="flex items-center gap-2 mb-2.5">
-                          <div className="w-6 h-6 rounded-md bg-white/[0.06] flex items-center justify-center shrink-0">
-                            <Globe className="w-3 h-3 text-muted-foreground group-hover:text-primary transition-colors duration-300" />
-                          </div>
-                          <span className="text-xs font-medium truncate text-[hsl(0,0%,82%)] group-hover:text-white transition-colors duration-300">{domain}</span>
-                        </div>
-                        <span className="text-[10px] text-muted-foreground/40 font-mono">{timeAgo(item.created_at)}</span>
+                      {/* Favicon */}
+                      <img
+                        src={`https://www.google.com/s2/favicons?domain=${domain}&sz=32`}
+                        alt=""
+                        className="w-5 h-5 rounded shrink-0 bg-white/[0.06] group-hover:scale-110 transition-transform duration-200"
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; (e.target as HTMLImageElement).nextElementSibling?.classList.remove("hidden"); }}
+                      />
+                      <div className="w-5 h-5 rounded bg-white/[0.06] items-center justify-center shrink-0 hidden">
+                        <Globe className="w-3 h-3 text-muted-foreground/50" />
                       </div>
+
+                      {/* Domain + path */}
+                      <div className="flex-1 min-w-0 flex items-baseline gap-1.5">
+                        <span className="text-sm font-medium text-[hsl(0,0%,85%)] group-hover:text-white transition-colors duration-200 truncate">{domain}</span>
+                        {path !== "/" && (
+                          <span className="text-xs text-muted-foreground/30 font-mono truncate hidden sm:inline">{path}</span>
+                        )}
+                      </div>
+
+                      {/* Time */}
+                      <span className="text-[11px] text-muted-foreground/30 font-mono shrink-0 tabular-nums">{timeAgo(item.created_at)}</span>
+
+                      {/* Arrow */}
+                      <ArrowRight className="w-3.5 h-3.5 text-muted-foreground/0 group-hover:text-muted-foreground/40 transition-all duration-200 shrink-0" />
                     </motion.button>
                   );
                 })}
-              </motion.div>
+              </div>
 
               {clonePages > 1 && (
-                <div className="flex items-center justify-center gap-1 mt-8">
+                <div className="flex items-center justify-center gap-1 mt-6">
                   <button onClick={() => setClonePage((p) => Math.max(1, p - 1))} disabled={clonePage <= 1}
                     className="p-2 rounded-md text-sm text-muted-foreground hover:text-foreground hover:bg-white/[0.08] disabled:opacity-20 disabled:cursor-not-allowed transition-colors">
                     <ChevronLeft className="w-3.5 h-3.5" />
