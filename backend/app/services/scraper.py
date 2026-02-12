@@ -786,53 +786,119 @@ async def scrape_and_capture(url: str) -> dict:
     }
 
 
-def _extract_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """Extract all image URLs from the page."""
-    urls = set()
+def _resolve_url(u: str, parsed) -> str | None:
+    """Resolve a URL to absolute, or return None for data URIs."""
+    if u.startswith("data:"):
+        return None
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return f"{parsed.scheme}://{parsed.netloc}{u}"
+    if not u.startswith("http"):
+        return f"{parsed.scheme}://{parsed.netloc}/{u}"
+    return u
+
+
+def _nearby_text(tag, max_len: int = 60) -> str:
+    """Get nearby text context for an image — check alt, parent, and siblings."""
+    # Check alt text first
+    alt = tag.get("alt", "").strip()
+    if alt:
+        return alt[:max_len]
+
+    # Walk up to find text in the closest container
+    for parent in tag.parents:
+        if parent.name in ("a", "div", "li", "article", "figure", "section", "td"):
+            text = parent.get_text(separator=" ", strip=True)
+            # Remove the image's own alt from the text
+            if text and len(text) > 3:
+                return text[:max_len]
+            break
+
+    # Check next sibling
+    sibling = tag.find_next_sibling()
+    if sibling:
+        text = sibling.get_text(separator=" ", strip=True)
+        if text:
+            return text[:max_len]
+
+    return ""
+
+
+def _extract_image_urls(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """Extract image URLs with context (alt, dimensions, container, nearby text)."""
+    seen_urls = set()
+    images = []
     parsed = urlparse(base_url)
 
     for img in soup.find_all("img"):
-        for attr in ["src", "data-src", "data-lazy-src"]:
-            src = img.get(attr)
-            if src:
-                urls.add(src)
+        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
+        if not src:
+            continue
+        url = _resolve_url(src, parsed)
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
 
+        # Get container class
+        container = ""
+        for parent in img.parents:
+            if parent.name in ("div", "a", "li", "article", "figure", "section", "td"):
+                cls = parent.get("class", [])
+                if cls:
+                    container = cls[0] if isinstance(cls, list) else cls
+                break
+
+        images.append({
+            "url": url,
+            "alt": (img.get("alt") or "").strip()[:80],
+            "width": img.get("width", ""),
+            "height": img.get("height", ""),
+            "container": container,
+            "context": _nearby_text(img),
+        })
+
+    # srcset images (no context, just URLs)
     for tag in soup.find_all(["img", "source"]):
         srcset = tag.get("srcset", "")
         for part in srcset.split(","):
             url_part = part.strip().split(" ")[0]
-            if url_part:
-                urls.add(url_part)
+            if not url_part:
+                continue
+            url = _resolve_url(url_part, parsed)
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                images.append({"url": url, "alt": "", "width": "", "height": "", "container": "", "context": ""})
 
+    # Background images
     for tag in soup.find_all(style=True):
         style = tag["style"]
         for match in re.findall(r'url\(["\']?(.*?)["\']?\)', style):
-            urls.add(match)
+            url = _resolve_url(match, parsed)
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                images.append({"url": url, "alt": "background", "width": "", "height": "", "container": "", "context": ""})
 
+    # Favicons
     for link in soup.find_all("link", rel=True):
         rels = link.get("rel", [])
         if any(r in rels for r in ["icon", "shortcut", "apple-touch-icon"]):
             href = link.get("href")
             if href:
-                urls.add(href)
+                url = _resolve_url(href, parsed)
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    images.append({"url": url, "alt": "favicon", "width": "", "height": "", "container": "", "context": ""})
 
+    # OG image
     og_img = soup.find("meta", property="og:image")
     if og_img and og_img.get("content"):
-        urls.add(og_img["content"])
+        url = _resolve_url(og_img["content"], parsed)
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            images.append({"url": url, "alt": "og:image", "width": "", "height": "", "container": "", "context": ""})
 
-    filtered = []
-    for u in urls:
-        if u.startswith("data:"):
-            continue
-        if u.startswith("//"):
-            u = "https:" + u
-        elif u.startswith("/"):
-            u = f"{parsed.scheme}://{parsed.netloc}{u}"
-        elif not u.startswith("http"):
-            u = f"{parsed.scheme}://{parsed.netloc}/{u}"
-        filtered.append(u)
-
-    return filtered
+    return images
 
 
 def _clean_html(soup: BeautifulSoup) -> str:

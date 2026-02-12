@@ -1029,7 +1029,7 @@ export default function Home() {
                         })()}
 
                         {/* Expanded details */}
-                        {isOpen && !isDone && (
+                        {(isOpen || isActive) && !isDone && (
                           <div className="mt-2 ml-[22px] space-y-1">
                             {phase.entries.filter((e): e is MessageLogEntry => e.kind === "message").map((entry) => (
                               <div key={entry.id} className="flex items-center gap-2 py-0.5">
@@ -1072,12 +1072,114 @@ export default function Home() {
         {/* Right: Preview / Code panel */}
         <div className="flex-1 flex flex-col overflow-hidden bg-[hsl(0,0%,7%)]">
           {isLoading && !previewUrl && (
-            <div className="flex-1 flex items-center justify-center">
-              <div className="text-center">
-                <div className="relative inline-flex items-center justify-center mb-8">
-                  <div className="absolute w-24 h-24 rounded-full bg-primary/10 animate-pulse-ring" />
-                  <div className="absolute w-16 h-16 rounded-full bg-primary/[0.06] animate-pulse" />
-                  <ClonrLogo size={40} className="relative" />
+            <div className="flex-1 flex items-center justify-center relative overflow-hidden">
+              {/* PCB grid background */}
+              <div className="absolute inset-0 pcb-grid" />
+              {/* Radial glow from center — shifts with stage */}
+              <div className="absolute inset-0 transition-all duration-1000" style={{
+                background: status === "scraping"
+                  ? "radial-gradient(circle at 50% 45%, hsla(145, 80%, 50%, 0.1) 0%, hsla(160, 90%, 45%, 0.04) 25%, transparent 60%)"
+                  : status === "deploying"
+                  ? "radial-gradient(circle at 50% 45%, hsla(0, 85%, 58%, 0.1) 0%, hsla(350, 80%, 55%, 0.04) 25%, transparent 60%)"
+                  : "radial-gradient(circle at 50% 45%, hsla(45, 100%, 55%, 0.1) 0%, hsla(38, 100%, 58%, 0.04) 25%, transparent 60%)",
+              }} />
+              {/* Animated aurora bands — color-coded by stage */}
+              <div className="absolute inset-0 overflow-hidden">
+                <div className={`aurora-band aurora-band-1 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : "aurora-yellow"}`} />
+                <div className={`aurora-band aurora-band-2 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : "aurora-yellow"}`} />
+                <div className={`aurora-band aurora-band-3 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : "aurora-yellow"}`} />
+              </div>
+              {/* Vignette */}
+              <div className="absolute inset-0" style={{
+                background: "radial-gradient(ellipse 70% 60% at 50% 50%, transparent 30%, hsl(0 0% 7%) 80%)",
+              }} />
+              <div className="text-center relative z-10">
+                <div className="relative inline-flex items-center justify-center mb-10" style={{ width: 280, height: 280 }}>
+                  {/* Circuit traces SVG */}
+                  <svg className="absolute inset-0 w-full h-full" viewBox="0 0 280 280" fill="none">
+                    {/* Circuit traces — lines flowing inward toward the CPU */}
+                    {(() => {
+                      // Stage-based color palettes
+                      const palettes = {
+                        scraping:   ["hsl(145, 80%, 50%)", "hsl(160, 90%, 45%)", "hsl(130, 85%, 55%)", "hsl(170, 75%, 48%)", "hsl(140, 95%, 40%)"],
+                        generating: ["hsl(45, 100%, 55%)", "hsl(38, 100%, 58%)", "hsl(50, 95%, 50%)", "hsl(32, 100%, 60%)", "hsl(55, 90%, 52%)"],
+                        deploying:  ["hsl(0, 85%, 58%)", "hsl(350, 80%, 55%)", "hsl(10, 90%, 55%)", "hsl(340, 75%, 60%)", "hsl(15, 85%, 50%)"],
+                      };
+                      const colors = palettes[status as keyof typeof palettes] || palettes.generating;
+                      return [
+                        // Top traces
+                        { d: "M140 0 L140 40 L140 90", ci: 0, delay: 0 },
+                        { d: "M100 5 L100 50 L120 70 L120 95", ci: 1, delay: 0.3 },
+                        { d: "M180 5 L180 50 L160 70 L160 95", ci: 2, delay: 0.6 },
+                        { d: "M60 15 L60 55 L95 90 L110 90 L110 100", ci: 3, delay: 0.9 },
+                        { d: "M220 15 L220 55 L185 90 L170 90 L170 100", ci: 4, delay: 1.2 },
+                        // Bottom traces
+                        { d: "M140 280 L140 240 L140 190", ci: 0, delay: 0.4 },
+                        { d: "M100 275 L100 230 L120 210 L120 185", ci: 1, delay: 0.7 },
+                        { d: "M180 275 L180 230 L160 210 L160 185", ci: 2, delay: 1.0 },
+                        { d: "M60 265 L60 225 L95 190 L110 190 L110 180", ci: 3, delay: 1.3 },
+                        { d: "M220 265 L220 225 L185 190 L170 190 L170 180", ci: 4, delay: 0.2 },
+                        // Left traces
+                        { d: "M0 140 L40 140 L90 140", ci: 0, delay: 0.8 },
+                        { d: "M5 100 L50 100 L70 120 L95 120", ci: 1, delay: 1.1 },
+                        { d: "M5 180 L50 180 L70 160 L95 160", ci: 2, delay: 0.5 },
+                        { d: "M15 60 L55 60 L90 95 L90 110 L100 110", ci: 3, delay: 1.4 },
+                        { d: "M15 220 L55 220 L90 185 L90 170 L100 170", ci: 4, delay: 0.1 },
+                        // Right traces
+                        { d: "M280 140 L240 140 L190 140", ci: 0, delay: 1.2 },
+                        { d: "M275 100 L230 100 L210 120 L185 120", ci: 1, delay: 0.6 },
+                        { d: "M275 180 L230 180 L210 160 L185 160", ci: 2, delay: 0.9 },
+                        { d: "M265 60 L225 60 L190 95 L190 110 L180 110", ci: 3, delay: 0.3 },
+                        { d: "M265 220 L225 220 L190 185 L190 170 L180 170", ci: 4, delay: 1.5 },
+                        // Diagonal corner traces
+                        { d: "M30 30 L65 65 L90 90 L100 100", ci: 0, delay: 0.15 },
+                        { d: "M250 30 L215 65 L190 90 L180 100", ci: 3, delay: 0.75 },
+                        { d: "M30 250 L65 215 L90 190 L100 180", ci: 4, delay: 1.35 },
+                        { d: "M250 250 L215 215 L190 190 L180 180", ci: 1, delay: 0.45 },
+                      ].map((trace) => ({ ...trace, color: colors[trace.ci] }));
+                    })().map((trace, i) => (
+                      <g key={i}>
+                        {/* Faint static trace path */}
+                        <path d={trace.d} stroke="white" strokeOpacity={0.06} strokeWidth={1.5} fill="none" />
+                        {/* Animated glowing pulse */}
+                        <path
+                          d={trace.d}
+                          stroke={trace.color}
+                          strokeWidth={2}
+                          fill="none"
+                          className="circuit-trace"
+                          style={{
+                            animation: `circuit-pulse 2.2s ease-in-out ${trace.delay}s infinite`,
+                            filter: `drop-shadow(0 0 4px ${trace.color})`,
+                          }}
+                        />
+                        {/* Bright tip dot */}
+                        <circle r="2" fill={trace.color} opacity={0}>
+                          <animateMotion
+                            dur="2.2s"
+                            begin={`${trace.delay}s`}
+                            repeatCount="indefinite"
+                            path={trace.d}
+                          />
+                          <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.85;1" dur="2.2s" begin={`${trace.delay}s`} repeatCount="indefinite" />
+                        </circle>
+                      </g>
+                    ))}
+                    {/* Junction dots at trace endpoints near CPU */}
+                    {[
+                      [140, 90], [120, 95], [160, 95], [110, 100], [170, 100],
+                      [140, 190], [120, 185], [160, 185], [110, 180], [170, 180],
+                      [90, 140], [95, 120], [95, 160], [100, 110], [100, 170],
+                      [190, 140], [185, 120], [185, 160], [180, 110], [180, 170],
+                      [100, 100], [180, 100], [100, 180], [180, 180],
+                    ].map(([cx, cy], i) => (
+                      <circle key={`dot-${i}`} cx={cx} cy={cy} r="2" fill="white" opacity={0.2} />
+                    ))}
+                  </svg>
+                  {/* CPU core — the logo */}
+                  <div className={`relative z-10 w-24 h-24 rounded-2xl bg-[hsl(0,0%,9%)] border border-white/10 flex items-center justify-center transition-shadow duration-1000 ${status === "scraping" ? "cpu-core-green" : status === "deploying" ? "cpu-core-red" : "cpu-core-yellow"}`}>
+                    <ClonrLogo size={56} className="relative" />
+                  </div>
                 </div>
                 <p className="text-muted-foreground/50 text-xs font-mono tracking-wide">building your clone...</p>
               </div>
