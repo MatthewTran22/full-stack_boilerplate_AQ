@@ -89,7 +89,7 @@ const fadeIn = {
 
 type CloneStatus = "idle" | "scraping" | "generating" | "deploying" | "done" | "error";
 
-type LogEntry = MessageLogEntry | FileLogEntry | ScreenshotLogEntry;
+type LogEntry = MessageLogEntry | FileLogEntry | ScreenshotLogEntry | SectionLogEntry;
 
 interface MessageLogEntry {
   kind: "message";
@@ -112,6 +112,15 @@ interface ScreenshotLogEntry {
   kind: "screenshot";
   id: number;
   src: string;
+  timestamp: Date;
+}
+
+interface SectionLogEntry {
+  kind: "section";
+  id: number;
+  section: number;
+  total: number;
+  components: string[];
   timestamp: Date;
 }
 
@@ -155,6 +164,8 @@ export default function Home() {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [expandedPhases, setExpandedPhases] = useState<Set<string>>(new Set());
   const [aiUsage, setAiUsage] = useState<CloneUsage | null>(null);
+  const [sectionTotal, setSectionTotal] = useState(0);
+  const [sectionsComplete, setSectionsComplete] = useState<Set<number>>(new Set());
   const [elapsed, setElapsed] = useState(0);
   const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -231,6 +242,8 @@ export default function Home() {
     setActiveFile(null);
     setLogEntries([]);
     setElapsed(0);
+    setSectionTotal(0);
+    setSectionsComplete(new Set());
     setExpandedPhases(new Set());
     logIdRef.current = 0;
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
@@ -260,11 +273,20 @@ export default function Home() {
           addMessageLog(getIconForStatus(data.status, data.message || ""), data.message || "");
         } else if (data.status === "generating") {
           setStatus("generating");
+          // Detect section count from message like "AI is generating the clone (3 sections)..."
+          const sectionMatch = (data.message || "").match(/\((\d+)\s+sections?\)/);
+          if (sectionMatch) setSectionTotal(parseInt(sectionMatch[1], 10));
           addMessageLog(getIconForStatus(data.status, data.message || ""), data.message || "");
         } else if (data.status === "section_complete") {
-          const names = (data.components || []).join(", ");
-          const msg = data.message || `Section complete${names ? ` (${names})` : ""}`;
-          addMessageLog("cpu", msg, "done");
+          const sec = data.section || 0;
+          const tot = data.total || 0;
+          if (tot > 0) setSectionTotal(tot);
+          setSectionsComplete((prev) => new Set(prev).add(sec));
+          const id = ++logIdRef.current;
+          setLogEntries((prev) => [
+            ...prev,
+            { kind: "section" as const, id, section: sec, total: tot, components: data.components || [], timestamp: new Date() },
+          ]);
         } else if (data.status === "fixing") {
           setStatus("deploying");
           addMessageLog("wrench", data.message || "Fixing error...");
@@ -326,6 +348,8 @@ export default function Home() {
     setActiveFile(null);
     setLogEntries([]);
     setAiUsage(null);
+    setSectionTotal(0);
+    setSectionsComplete(new Set());
   };
 
   const timeAgo = (dateStr: string) => {
@@ -659,8 +683,8 @@ export default function Home() {
               <PanelLeftClose className="w-3.5 h-3.5 text-muted-foreground/50" />
             </button>
           </div>
-          <div className="flex-1 overflow-y-auto px-3 py-2.5">
-            <div className="space-y-1.5">
+          <div className="flex-1 overflow-y-auto px-4 py-4">
+            <div className="relative">
               {(() => {
                 type Phase = { id: string; label: string; icon: MessageLogEntry["icon"]; status: "active" | "done" | "error"; entries: LogEntry[]; summary?: string; startTime?: Date; endTime?: Date; };
                 const phases: Phase[] = [];
@@ -672,6 +696,7 @@ export default function Home() {
                   if (entry.kind === "message") phaseKey = phaseMap[entry.icon] || "other";
                   else if (entry.kind === "file") phaseKey = "generate";
                   else if (entry.kind === "screenshot") phaseKey = "scrape";
+                  else if (entry.kind === "section") phaseKey = "generate";
 
                   if (!current || current.id !== phaseKey) {
                     current = {
@@ -690,10 +715,12 @@ export default function Home() {
                 for (const phase of phases) {
                   const files = phase.entries.filter((e): e is FileLogEntry => e.kind === "file");
                   const screenshots = phase.entries.filter((e): e is ScreenshotLogEntry => e.kind === "screenshot");
+                  const sections = phase.entries.filter((e): e is SectionLogEntry => e.kind === "section");
                   const parts: string[] = [];
                   if (screenshots.length) parts.push(`${screenshots.length} screenshot${screenshots.length > 1 ? "s" : ""}`);
-                  if (files.length) { const totalLines = files.reduce((s, f) => s + f.lines, 0); parts.push(`${files.length} files (+${totalLines} lines)`); }
-                  if (parts.length) phase.summary = parts.join(", ");
+                  if (sections.length > 0) parts.push(`${sections.length} agent${sections.length > 1 ? "s" : ""}`);
+                  if (files.length) { const totalLines = files.reduce((s, f) => s + f.lines, 0); parts.push(`${files.length} files · ${totalLines} lines`); }
+                  if (parts.length) phase.summary = parts.join(" · ");
                 }
 
                 const togglePhase = (id: string) => { setExpandedPhases((prev) => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next; }); };
@@ -706,92 +733,197 @@ export default function Home() {
                   const isActive = phase.status === "active";
                   const isDone = phase.id === "done";
                   const isError = phase.status === "error";
-
-                  if (isDone) {
-                    return (
-                      <div key={phaseKey} className="rounded-lg bg-emerald-500/[0.06] border border-emerald-500/20">
-                        <div className="flex items-center gap-2.5 py-2.5 px-3">
-                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                          <span className="text-xs font-medium text-emerald-400 flex-1">Clone complete</span>
-                          {elapsed > 0 && <span className="text-[10px] text-muted-foreground/40 tabular-nums font-mono">{Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}</span>}
-                        </div>
-                        {aiUsage && (
-                          <div className="px-3 pb-2.5 flex items-center gap-3 text-[10px] font-mono text-muted-foreground/50">
-                            <span>${aiUsage.total_cost.toFixed(4)}</span>
-                            <span className="text-muted-foreground/20">|</span>
-                            <span>{(aiUsage.tokens_in / 1000).toFixed(1)}k in</span>
-                            <span className="text-muted-foreground/20">|</span>
-                            <span>{(aiUsage.tokens_out / 1000).toFixed(1)}k out</span>
-                            <span className="text-muted-foreground/20">|</span>
-                            <span>{aiUsage.api_calls} call{aiUsage.api_calls !== 1 ? "s" : ""}</span>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  }
+                  const isLast = idx === phases.length - 1;
 
                   const files = phase.entries.filter((e): e is FileLogEntry => e.kind === "file");
                   const screenshots = phase.entries.filter((e): e is ScreenshotLogEntry => e.kind === "screenshot");
 
-                  return (
-                    <div key={phaseKey} className={`rounded-lg border transition-colors ${isActive ? "bg-primary/[0.04] border-primary/20" : isError ? "bg-destructive/[0.04] border-destructive/20" : "bg-white/[0.04] border-[hsl(0,0%,18%)]"}`}>
-                      <button onClick={() => togglePhase(phaseKey)} className="w-full flex items-center gap-2.5 px-3 py-2.5 text-left">
-                        <ChevronRight className={`w-2.5 h-2.5 shrink-0 text-muted-foreground/40 transition-transform duration-150 ${isOpen ? "rotate-90" : ""}`} />
-                        <div className={`shrink-0 ${isActive ? "text-primary" : isError ? "text-destructive" : "text-muted-foreground/40"}`}>
-                          {isActive ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Icon className="w-3.5 h-3.5" />}
-                        </div>
-                        <span className={`text-xs font-medium flex-1 min-w-0 truncate ${isActive ? "text-foreground" : isError ? "text-destructive" : "text-muted-foreground/70"}`}>{phase.label}</span>
-                        {phase.summary && !isActive && <span className="text-[9px] text-muted-foreground/30 shrink-0 font-mono">{phase.summary}</span>}
-                        {!isActive && !isError && <CheckCircle2 className="w-3 h-3 text-emerald-500/60 shrink-0" />}
-                        {phaseDuration > 0 && !isActive && <span className="text-[9px] text-muted-foreground/25 shrink-0 tabular-nums font-mono">{phaseDuration}s</span>}
-                      </button>
+                  // Timeline dot color
+                  const dotColor = isDone ? "bg-emerald-400" : isError ? "bg-destructive" : isActive ? "bg-primary" : "bg-emerald-500/60";
 
-                      {isOpen && (
-                        <div className="px-3 pb-2.5 space-y-0.5">
-                          <div className="border-t border-[hsl(0,0%,15%)] pt-2">
+                  return (
+                    <div key={phaseKey} className="relative flex gap-3.5">
+                      {/* Timeline spine */}
+                      <div className="flex flex-col items-center shrink-0 pt-0.5">
+                        <div className={`relative z-10 w-2 h-2 rounded-full ${dotColor} ${isActive ? "ring-[3px] ring-primary/20" : ""}`}>
+                          {isActive && <div className="absolute inset-0 rounded-full bg-primary animate-ping opacity-40" />}
+                        </div>
+                        {!isLast && (
+                          <div className="w-px flex-1 mt-1.5 bg-gradient-to-b from-[hsl(0,0%,22%)] to-[hsl(0,0%,12%)]" />
+                        )}
+                      </div>
+
+                      {/* Phase content */}
+                      <div className={`flex-1 min-w-0 ${!isLast ? "pb-5" : "pb-1"}`}>
+                        {/* Phase header */}
+                        <button onClick={() => !isDone && togglePhase(phaseKey)} className={`w-full flex items-center gap-2 text-left group ${isDone ? "cursor-default" : ""}`}>
+                          <div className={`shrink-0 ${isActive ? "text-primary" : isDone ? "text-emerald-400" : isError ? "text-destructive" : "text-muted-foreground/50"}`}>
+                            {isActive ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Icon className="w-3.5 h-3.5" />}
+                          </div>
+                          <span className={`text-[13px] font-medium flex-1 min-w-0 ${isActive ? "text-foreground" : isDone ? "text-emerald-400" : isError ? "text-destructive" : "text-muted-foreground/80"}`}>{phase.label}</span>
+                          {phaseDuration > 0 && !isActive && <span className="text-[10px] text-muted-foreground/30 tabular-nums font-mono">{phaseDuration}s</span>}
+                          {!isDone && !isActive && !isError && (
+                            <ChevronRight className={`w-3 h-3 text-muted-foreground/20 transition-transform duration-150 group-hover:text-muted-foreground/40 ${isOpen ? "rotate-90" : ""}`} />
+                          )}
+                        </button>
+
+                        {/* Phase summary line */}
+                        {phase.summary && !isActive && !isDone && (
+                          <p className="text-[10px] text-muted-foreground/40 font-mono mt-0.5 ml-[22px]">{phase.summary}</p>
+                        )}
+
+                        {/* Done: usage stats */}
+                        {isDone && (
+                          <div className="mt-2 ml-[22px]">
+                            <div className="flex items-center gap-2 text-[10px] text-muted-foreground/40 font-mono">
+                              {elapsed > 0 && <span className="tabular-nums">{Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")} total</span>}
+                            </div>
+                            {aiUsage && (
+                              <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-1">
+                                <div className="flex items-baseline gap-1.5">
+                                  <span className="text-[10px] text-muted-foreground/30 font-mono">cost</span>
+                                  <span className="text-[11px] text-muted-foreground/60 font-mono tabular-nums">${aiUsage.total_cost.toFixed(4)}</span>
+                                </div>
+                                <div className="flex items-baseline gap-1.5">
+                                  <span className="text-[10px] text-muted-foreground/30 font-mono">calls</span>
+                                  <span className="text-[11px] text-muted-foreground/60 font-mono tabular-nums">{aiUsage.api_calls}</span>
+                                </div>
+                                <div className="flex items-baseline gap-1.5">
+                                  <span className="text-[10px] text-muted-foreground/30 font-mono">in</span>
+                                  <span className="text-[11px] text-muted-foreground/60 font-mono tabular-nums">{(aiUsage.tokens_in / 1000).toFixed(1)}k</span>
+                                </div>
+                                <div className="flex items-baseline gap-1.5">
+                                  <span className="text-[10px] text-muted-foreground/30 font-mono">out</span>
+                                  <span className="text-[11px] text-muted-foreground/60 font-mono tabular-nums">{(aiUsage.tokens_out / 1000).toFixed(1)}k</span>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Active state: show elapsed or parallel agents */}
+                        {isActive && phase.id !== "generate" && (
+                          <div className="mt-1.5 ml-[22px] flex items-center gap-2">
+                            <div className="w-1 h-1 rounded-full bg-primary/60 animate-pulse" />
+                            <span className="text-[10px] text-muted-foreground/40 font-mono">
+                              {elapsed > 0 && `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`}
+                            </span>
+                          </div>
+                        )}
+
+                        {/* ── Parallel agents view for generate phase ── */}
+                        {phase.id === "generate" && sectionTotal > 0 && (
+                          <div className="mt-2.5 ml-[22px] space-y-2">
+                            {Array.from({ length: sectionTotal }, (_, i) => i + 1).map((sec) => {
+                              const isDoneSec = sectionsComplete.has(sec);
+                              const sectionEntry = phase.entries.find((e): e is SectionLogEntry => e.kind === "section" && e.section === sec);
+                              const comps = sectionEntry?.components || [];
+
+                              return (
+                                <div key={sec} className="group">
+                                  {/* Agent header */}
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <div className={`w-4 h-4 rounded flex items-center justify-center text-[9px] font-mono font-bold ${isDoneSec ? "bg-emerald-500/15 text-emerald-400" : "bg-primary/15 text-primary"}`}>
+                                      {sec}
+                                    </div>
+                                    <span className={`text-[11px] font-medium ${isDoneSec ? "text-muted-foreground/60" : "text-foreground/80"}`}>
+                                      Agent {sec}
+                                    </span>
+                                    {isDoneSec && <CheckCircle2 className="w-3 h-3 text-emerald-500/50 ml-auto" />}
+                                    {!isDoneSec && isActive && (
+                                      <span className="text-[9px] text-primary/50 font-mono ml-auto">running</span>
+                                    )}
+                                  </div>
+
+                                  {/* Progress bar */}
+                                  <div className="h-1.5 rounded-full bg-white/[0.04] overflow-hidden">
+                                    <div
+                                      className={`h-full rounded-full transition-all duration-700 ease-out ${
+                                        isDoneSec
+                                          ? "w-full bg-gradient-to-r from-emerald-500/40 to-emerald-400/60"
+                                          : "agent-bar-running bg-gradient-to-r from-primary/30 via-primary/50 to-primary/30"
+                                      }`}
+                                    />
+                                  </div>
+
+                                  {/* Components generated */}
+                                  {isDoneSec && comps.length > 0 && (
+                                    <div className="flex flex-wrap gap-1 mt-1.5">
+                                      {comps.map((c) => (
+                                        <span key={c} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/[0.04] text-muted-foreground/50">
+                                          {c}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+
+                            {/* Overall progress */}
+                            {isActive && (
+                              <div className="flex items-center gap-2 pt-1">
+                                <span className="text-[10px] text-muted-foreground/35 font-mono">
+                                  {sectionsComplete.size}/{sectionTotal} agents complete
+                                </span>
+                                {elapsed > 0 && (
+                                  <span className="text-[10px] text-muted-foreground/25 font-mono ml-auto tabular-nums">
+                                    {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Active generate with NO sections (single-section mode) */}
+                        {isActive && phase.id === "generate" && sectionTotal === 0 && (
+                          <div className="mt-1.5 ml-[22px] flex items-center gap-2">
+                            <div className="w-1 h-1 rounded-full bg-primary/60 animate-pulse" />
+                            <span className="text-[10px] text-muted-foreground/40 font-mono">
+                              {elapsed > 0 && `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`}
+                            </span>
+                          </div>
+                        )}
+
+                        {/* Expanded details */}
+                        {isOpen && !isDone && (
+                          <div className="mt-2 ml-[22px] space-y-1">
                             {phase.entries.filter((e): e is MessageLogEntry => e.kind === "message").map((entry) => (
-                              <div key={entry.id} className="flex items-center gap-2 py-0.5 px-1">
-                                <span className="w-1 h-1 rounded-full bg-muted-foreground/20 shrink-0" />
-                                <span className="text-[10px] text-muted-foreground/50 truncate flex-1 font-mono">{entry.message}</span>
-                                <span className="text-[9px] text-muted-foreground/20 shrink-0 tabular-nums font-mono">{entry.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+                              <div key={entry.id} className="flex items-center gap-2 py-0.5">
+                                <span className="w-0.5 h-0.5 rounded-full bg-muted-foreground/25 shrink-0" />
+                                <span className="text-[10px] text-muted-foreground/45 flex-1 min-w-0 truncate font-mono">{entry.message}</span>
                               </div>
                             ))}
                             {screenshots.map((s) => (
-                              <div key={s.id} className="flex items-center gap-2 py-0.5 px-1">
-                                <Camera className="w-3 h-3 text-muted-foreground/30 shrink-0" />
-                                <span className="text-[10px] text-muted-foreground/50 flex-1 font-mono">Screenshot captured</span>
-                                <img src={s.src} alt="Screenshot" className="w-12 h-8 rounded border border-[hsl(0,0%,18%)] cursor-pointer hover:opacity-70 transition-opacity object-cover shrink-0" onClick={() => setExpandedScreenshot(s.src)} />
+                              <div key={s.id} className="mt-1.5">
+                                <img
+                                  src={s.src} alt="Screenshot"
+                                  className="w-full max-w-[200px] rounded-md border border-[hsl(0,0%,15%)] cursor-pointer hover:border-primary/30 hover:shadow-lg hover:shadow-primary/5 transition-all duration-200 object-cover"
+                                  onClick={() => setExpandedScreenshot(s.src)}
+                                />
                               </div>
                             ))}
                             {files.length > 0 && (
-                              <div className="mt-1.5 rounded-md bg-[hsl(0,0%,10%)] border border-[hsl(0,0%,15%)] overflow-hidden">
+                              <div className="mt-1.5 space-y-px rounded-md overflow-hidden">
                                 {files.map((f) => (
-                                  <div key={f.id} className="flex items-center gap-2 px-2.5 py-1">
-                                    <FileCode2 className="w-2.5 h-2.5 text-muted-foreground/30 shrink-0" />
-                                    <span className="text-[10px] text-[hsl(0,0%,62%)] truncate flex-1 font-mono">{f.file}</span>
+                                  <div key={f.id} className="flex items-center gap-2 py-1 px-2 bg-white/[0.02] first:rounded-t-md last:rounded-b-md">
+                                    <FileCode2 className="w-2.5 h-2.5 text-muted-foreground/25 shrink-0" />
+                                    <span className="text-[10px] text-muted-foreground/55 truncate flex-1 font-mono">{f.file}</span>
                                     <span className="text-[9px] font-mono text-emerald-400/50 shrink-0">+{f.lines}</span>
                                   </div>
                                 ))}
                               </div>
                             )}
                           </div>
-                        </div>
-                      )}
+                        )}
+                      </div>
                     </div>
                   );
                 });
               })()}
               <div ref={logEndRef} />
             </div>
-
-            {isLoading && (
-              <div className="mt-5 pt-4 border-t border-[hsl(0,0%,13%)]">
-                <div className="flex items-center gap-2.5 text-xs text-muted-foreground/50 font-mono">
-                  <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-                  Working... {elapsed > 0 && `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`}
-                </div>
-              </div>
-            )}
           </div>
         </div>
 
