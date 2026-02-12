@@ -9,8 +9,10 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
+import re as _re
+import urllib.parse as _urlparse
 from app.services.scraper import scrape_and_capture
-from app.services.ai_generator import generate_clone
+from app.services.ai_generator import generate_clone, fix_component
 from app.services.sandbox import (
     setup_sandbox_shell,
     upload_file_to_sandbox,
@@ -65,6 +67,78 @@ def sse_event(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
+async def _check_page_error(dev_url: str, clone_id: str | None = None) -> dict | None:
+    """Fetch the page from the dev server and check for Next.js errors.
+
+    Returns None if the page is healthy, or {"file": ..., "message": ...} if an error is detected.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(dev_url.rstrip("/") + "/")
+
+            # 200 with no error markers = healthy
+            if resp.status_code == 200 and "__next_error__" not in resp.text:
+                return None
+
+            body = resp.text
+            error_msg = ""
+            error_file = ""
+
+            # Strategy 1: Check the dev server log for errors (most reliable)
+            if clone_id:
+                from app.services.sandbox import _sandbox_instances
+                sandbox = _sandbox_instances.get(clone_id)
+                if sandbox:
+                    try:
+                        log_output = sandbox.process.exec("tail -50 /tmp/next-dev.log 2>/dev/null", timeout=5)
+                        log_text = log_output.output if hasattr(log_output, "output") else str(log_output)
+
+                        # Look for compilation/runtime errors in Next.js log
+                        # Patterns: "Error:", "TypeError:", "SyntaxError:", "Module not found"
+                        for line in log_text.split("\n"):
+                            if any(kw in line for kw in ["Error:", "TypeError:", "ReferenceError:", "SyntaxError:", "Module not found"]):
+                                error_msg = line.strip()[:300]
+                                break
+
+                        # Look for file references in the log
+                        file_match = _re.search(r'[./]*(components/\w+\.tsx)', log_text)
+                        if file_match:
+                            error_file = file_match.group(1)
+                        if not error_file:
+                            file_match = _re.search(r'[./]*(app/page\.tsx)', log_text)
+                            if file_match:
+                                error_file = file_match.group(1)
+                    except Exception:
+                        pass
+
+            # Strategy 2: Parse error from the HTML response
+            if not error_msg:
+                msg_match = _re.search(
+                    r'(?:Error|TypeError|ReferenceError|SyntaxError):\s*(.+?)(?:<|\\n|")',
+                    body,
+                )
+                if msg_match:
+                    error_msg = msg_match.group(0).split("<")[0].strip()[:300]
+
+            # Strategy 3: Look for file references in HTML
+            if not error_file:
+                file_match = _re.search(r'components[/\\](\w+)\.tsx', body)
+                if file_match:
+                    error_file = f"components/{file_match.group(1)}.tsx"
+
+            if not error_msg:
+                error_msg = f"Page returned HTTP {resp.status_code}"
+
+            if error_msg or resp.status_code >= 500:
+                logger.info(f"[health-check] Error detected: {error_msg} in {error_file or '(unknown file)'}")
+                return {"file": error_file, "message": error_msg}
+
+            return None
+    except Exception as e:
+        logger.warning(f"[health-check] Failed to check page: {e}")
+        return None
+
+
 
 @router.post("/api/clone")
 async def clone_website(request: CloneRequest, raw_request: Request):
@@ -112,6 +186,8 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 scraped_logos = scrape_result.get("logos", [])
                 scraped_interactives = scrape_result.get("interactives", [])
                 scraped_linked_pages = scrape_result.get("linked_pages", [])
+                scroll_positions = scrape_result.get("scroll_positions", [])
+                page_total_height = scrape_result.get("total_height", 0)
             except Exception as e:
                 logger.error(f"[clone:{clone_id}] Scraping failed for {url}: {e}")
                 yield sse_event({"status": "error", "message": f"Failed to scrape website: {e}"})
@@ -122,14 +198,16 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 f"{len(html_source)} chars HTML, {len(image_urls)} images ({t_scrape:.1f}s)"
             )
 
+            section_info = f" (scroll positions: {scroll_positions})" if len(scroll_positions) > 1 else ""
             yield sse_event({
                 "status": "screenshot",
-                "message": f"Captured {len(screenshots)} viewport screenshots ({t_scrape:.0f}s)",
+                "message": f"Captured {len(screenshots)} viewport screenshots ({t_scrape:.0f}s){section_info}",
                 "screenshot": screenshots[0] if screenshots else "",
             })
 
             # Step 2: AI generation + sandbox setup IN PARALLEL
-            yield sse_event({"status": "generating", "message": "AI is generating the clone..."})
+            gen_msg = f"AI is generating the clone ({len(screenshots)} sections)..." if len(screenshots) > 1 else "AI is generating the clone..."
+            yield sse_event({"status": "generating", "message": gen_msg})
             t1 = time.time()
 
             all_template_files = get_template_files()
@@ -147,28 +225,101 @@ async def clone_website(request: CloneRequest, raw_request: Request):
 
             sandbox_task = asyncio.create_task(_setup_sandbox())
 
-            # Run AI generation concurrently
-            try:
-                ai_result = await generate_clone(
-                    html=html_source,
-                    screenshots=screenshots,
-                    image_urls=image_urls,
-                    url=url,
-                    styles=scraped_styles,
-                    font_links=font_links,
-                    icons=scraped_icons,
-                    svgs=scraped_svgs,
-                    logos=scraped_logos,
-                    interactives=scraped_interactives,
-                    linked_pages=scraped_linked_pages,
-                    on_status=on_status,
-                )
-                files = ai_result["files"]
-            except Exception as e:
-                logger.error(f"[clone:{clone_id}] AI generation failed: {e}")
+            # Run AI generation as a background task so we can stream progress
+            ai_result_box: list = []
+            ai_error_box: list = []
+
+            async def _run_ai():
+                try:
+                    result = await generate_clone(
+                        html=html_source,
+                        screenshots=screenshots,
+                        image_urls=image_urls,
+                        url=url,
+                        styles=scraped_styles,
+                        font_links=font_links,
+                        icons=scraped_icons,
+                        svgs=scraped_svgs,
+                        logos=scraped_logos,
+                        interactives=scraped_interactives,
+                        linked_pages=scraped_linked_pages,
+                        scroll_positions=scroll_positions,
+                        total_height=page_total_height,
+                        on_status=on_status,
+                    )
+                    ai_result_box.append(result)
+                except Exception as e:
+                    ai_error_box.append(e)
+                await status_queue.put({"_done": True})
+
+            ai_task = asyncio.create_task(_run_ai())
+
+            # Stream progress events in real-time while AI generates
+            while True:
+                try:
+                    event = await asyncio.wait_for(status_queue.get(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    if ai_task.done():
+                        break
+                    continue
+
+                if isinstance(event, dict) and event.get("_done"):
+                    break
+
+                # Forward event to SSE stream
+                if isinstance(event, str):
+                    yield sse_event({"status": "generating", "message": event})
+                elif isinstance(event, dict):
+                    evt_type = event.get("type", "")
+                    if evt_type == "section_complete":
+                        names = ", ".join(event.get("components", []))
+                        sec = event.get("section", "?")
+                        tot = event.get("total", "?")
+                        msg = f"Section {sec}/{tot} complete ({names})" if names else f"Section {sec}/{tot} complete"
+                        yield sse_event({
+                            "status": "section_complete",
+                            "message": msg,
+                            "section": sec,
+                            "total": tot,
+                            "components": event.get("components", []),
+                        })
+                    elif evt_type == "file_write":
+                        yield sse_event({
+                            "status": "file_write",
+                            "type": "file_write",
+                            "file": event.get("file", ""),
+                            "action": event.get("action", "create"),
+                            "lines": event.get("lines", 0),
+                        })
+                    else:
+                        yield sse_event(event)
+
+            # Drain any remaining queue events
+            while not status_queue.empty():
+                try:
+                    event = status_queue.get_nowait()
+                    if isinstance(event, dict) and event.get("_done"):
+                        continue
+                    if isinstance(event, str):
+                        yield sse_event({"status": "generating", "message": event})
+                    elif isinstance(event, dict):
+                        evt_type = event.get("type", "")
+                        if evt_type == "file_write":
+                            yield sse_event({"status": "file_write", "type": "file_write", "file": event.get("file", ""), "action": event.get("action", "create"), "lines": event.get("lines", 0)})
+                        elif evt_type != "section_complete":
+                            yield sse_event(event)
+                except asyncio.QueueEmpty:
+                    break
+
+            if ai_error_box:
+                logger.error(f"[clone:{clone_id}] AI generation failed: {ai_error_box[0]}")
                 sandbox_task.cancel()
-                yield sse_event({"status": "error", "message": str(e)})
+                yield sse_event({"status": "error", "message": str(ai_error_box[0])})
                 return
+
+            ai_result = ai_result_box[0] if ai_result_box else {"files": [], "deps": []}
+            files = ai_result["files"]
+            ai_usage = ai_result.get("usage", {})
             t_ai = time.time() - t1
             logger.info(f"[clone:{clone_id}] AI generation complete: {len(files)} files ({t_ai:.1f}s)")
 
@@ -176,17 +327,6 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 sandbox_task.cancel()
                 yield sse_event({"status": "error", "message": "AI returned no files"})
                 return
-
-            # Stream file info to frontend
-            for f in files:
-                line_count = f["content"].count("\n") + 1
-                yield sse_event({
-                    "status": "file_write",
-                    "type": "file_write",
-                    "file": f["path"],
-                    "action": "create",
-                    "lines": line_count,
-                })
 
             # Wait for sandbox to be ready
             yield sse_event({"status": "deploying", "message": "Waiting for sandbox..."})
@@ -223,6 +363,82 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                     preview_url = f"/api/sandbox/{clone_id}/"
                     logger.info(f"[clone:{clone_id}] Live preview proxied at {preview_url} → {dev_url}")
 
+                    # Auto-fix loop: check for runtime errors, fix with AI, hot reload
+                    MAX_FIX_RETRIES = 3
+                    files_map = {f["path"]: f for f in files}
+
+                    for fix_attempt in range(MAX_FIX_RETRIES):
+                        await asyncio.sleep(2)  # let Next.js compile
+                        error_info = await _check_page_error(dev_url, clone_id)
+                        if not error_info:
+                            break  # page is healthy
+
+                        err_file = error_info.get("file", "")
+                        err_msg = error_info.get("message", "Unknown error")
+                        logger.warning(
+                            f"[clone:{clone_id}] Fix attempt {fix_attempt + 1}/{MAX_FIX_RETRIES}: "
+                            f"{err_msg} in {err_file}"
+                        )
+                        yield sse_event({
+                            "status": "fixing",
+                            "message": f"Fixing error in {err_file} (attempt {fix_attempt + 1}/{MAX_FIX_RETRIES})...",
+                        })
+
+                        # Find the broken file in our generated files
+                        broken_file = files_map.get(err_file)
+                        if not broken_file:
+                            # Try matching by component name
+                            for path, f in files_map.items():
+                                if err_file.split("/")[-1] in path:
+                                    broken_file = f
+                                    err_file = path
+                                    break
+                        if not broken_file:
+                            logger.warning(f"[clone:{clone_id}] Could not find {err_file} in generated files, skipping fix")
+                            break
+
+                        # Ask AI to fix the component
+                        try:
+                            fix_result = await fix_component(
+                                file_path=err_file,
+                                file_content=broken_file["content"],
+                                error_message=err_msg,
+                            )
+                            fixed_content = fix_result["content"]
+                            fix_usage = fix_result["usage"]
+
+                            # Track fix cost in overall usage
+                            ai_usage["tokens_in"] = ai_usage.get("tokens_in", 0) + fix_usage["tokens_in"]
+                            ai_usage["tokens_out"] = ai_usage.get("tokens_out", 0) + fix_usage["tokens_out"]
+                            ai_usage["api_calls"] = ai_usage.get("api_calls", 0) + 1
+
+                            # Update file in our list and upload to sandbox (hot reload)
+                            broken_file["content"] = fixed_content
+                            upload_file_to_sandbox(clone_id, err_file, fixed_content)
+                            logger.info(f"[clone:{clone_id}] Uploaded fix for {err_file}, waiting for hot reload...")
+
+                            yield sse_event({
+                                "status": "file_write",
+                                "type": "file_write",
+                                "file": err_file,
+                                "action": "fix",
+                                "lines": fixed_content.count("\n") + 1,
+                            })
+                        except Exception as e:
+                            logger.error(f"[clone:{clone_id}] Fix attempt failed: {e}")
+                            break
+                    else:
+                        logger.warning(f"[clone:{clone_id}] Exhausted {MAX_FIX_RETRIES} fix attempts")
+
+                    # Recalculate total cost after fixes
+                    if ai_usage:
+                        from app.services.ai_generator import _calc_cost
+                        ai_usage["total_cost"] = _calc_cost(
+                            ai_usage.get("tokens_in", 0),
+                            ai_usage.get("tokens_out", 0),
+                            ai_usage.get("model", "anthropic/claude-sonnet-4.5"),
+                        )
+
                     # Persist source files to storage for sandbox re-creation later
                     source_files = {f["path"]: f["content"].encode("utf-8") for f in files}
                     upload_static_files(clone_id, source_files)
@@ -237,10 +453,11 @@ async def clone_website(request: CloneRequest, raw_request: Request):
 
             t_total = time.time() - t0
             total_lines = sum(f["content"].count("\n") + 1 for f in files)
+            cost_str = f", cost=${ai_usage.get('total_cost', 0):.4f}" if ai_usage else ""
             logger.info(
                 f"[clone:{clone_id}] DONE: {t_total:.1f}s total "
                 f"(scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox_wait={t_sandbox_wait:.1f}s) "
-                f"| {len(files)} files, {total_lines} lines"
+                f"| {len(files)} files, {total_lines} lines{cost_str}"
             )
 
             # Only save to DB if we have a working preview
@@ -272,6 +489,7 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                 "clone_id": clone_id,
                 "files": file_list,
                 "scaffold_paths": scaffold_paths,
+                "usage": ai_usage,
             })
 
         except HTTPException:
@@ -450,13 +668,19 @@ async def proxy_sandbox(clone_id: str, path: str):
             asyncio.create_task(_recreate_sandbox(clone_id))
         return HTMLResponse(content=LOADING_HTML)
 
-    # If Daytona returns an error (sandbox deleted), trigger re-creation
-    if resp.status_code >= 400:
-        logger.warning(f"[proxy:{clone_id}] Sandbox returned {resp.status_code}, triggering re-creation")
+    # Only recreate on gateway errors (502/503/504) — means sandbox is dead.
+    # 500 = Next.js compilation error (sandbox alive, code is broken) — pass through.
+    if resp.status_code in (502, 503, 504):
+        logger.warning(f"[proxy:{clone_id}] Sandbox returned {resp.status_code} (gateway error), triggering re-creation")
         _sandbox_urls.pop(clone_id, None)
         if clone_id not in _recreating:
             asyncio.create_task(_recreate_sandbox(clone_id))
         return HTMLResponse(content=LOADING_HTML)
+
+    if resp.status_code >= 400:
+        # Log the error body so we can debug compilation failures
+        error_snippet = resp.text[:500] if resp.text else "(empty)"
+        logger.warning(f"[proxy:{clone_id}] Sandbox returned {resp.status_code}: {error_snippet}")
 
     content_type = resp.headers.get("content-type", "")
 

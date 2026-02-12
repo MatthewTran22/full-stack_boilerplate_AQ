@@ -6,13 +6,14 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from PIL import Image
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
 logger = logging.getLogger(__name__)
 
 MAX_SCREENSHOT_DIM = 7000
 VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 720
-MAX_SCREENSHOTS = 8  # Cap to avoid huge AI payloads
+MAX_SCREENSHOTS = 5  # Cap parallel AI calls; screenshots are evenly spaced if page is tall
 
 
 # JS to extract computed styles, fonts, colors from the live page
@@ -204,8 +205,16 @@ EXTRACT_RENDERED_SVGS_JS = """
 EXTRACT_LOGO_IMAGES_JS = """
 () => {
     const logos = [];
-    const imgs = document.querySelectorAll('img');
+    const seen = new Set();
 
+    function addLogo(url, alt, width, height, reason) {
+        if (!url || url.startsWith('data:') || seen.has(url)) return;
+        seen.add(url);
+        logos.push({ url, alt: alt || '', width: Math.round(width), height: Math.round(height), reason });
+    }
+
+    // 1. Check <img> tags
+    const imgs = document.querySelectorAll('img');
     for (const img of imgs) {
         const rect = img.getBoundingClientRect();
         const src = img.src || img.dataset?.src || '';
@@ -214,14 +223,12 @@ EXTRACT_LOGO_IMAGES_JS = """
         let isLogo = false;
         let reason = '';
 
-        // Check attributes
         const searchable = (src + ' ' + (img.alt || '') + ' ' + (img.className || '') + ' ' + (img.id || '')).toLowerCase();
         if (searchable.includes('logo') || searchable.includes('brand')) {
             isLogo = true;
             reason = 'attribute match';
         }
 
-        // Check ancestor chain (nav, header, logo containers)
         let el = img.parentElement;
         let depth = 0;
         while (el && el !== document.body && depth < 8) {
@@ -240,7 +247,6 @@ EXTRACT_LOGO_IMAGES_JS = """
                 reason = 'inside nav/header';
                 break;
             }
-            // Link to homepage is often the logo container
             if (tag === 'a') {
                 const href = el.getAttribute('href') || '';
                 if (href === '/' || href === '#' || href.endsWith('.com') || href.endsWith('.com/') || href.endsWith('.io') || href.endsWith('.io/')) {
@@ -253,20 +259,59 @@ EXTRACT_LOGO_IMAGES_JS = """
             depth++;
         }
 
-        // Position: images near top of page and reasonable size
         if (!isLogo && rect.top < 80 && rect.width > 20 && rect.width < 400 && rect.height < 200) {
             isLogo = true;
             reason = 'top of page';
         }
 
         if (isLogo) {
-            logos.push({
-                url: src,
-                alt: img.alt || '',
-                width: Math.round(rect.width),
-                height: Math.round(rect.height),
-                reason: reason,
-            });
+            addLogo(src, img.alt, rect.width, rect.height, reason);
+        }
+    }
+
+    // 2. Check CSS background-image on elements in header/nav area (catches Amazon-style logos)
+    const headerEls = document.querySelectorAll('header, nav, [class*="header"], [class*="nav"], [id*="header"], [id*="nav"], [id*="logo"], [class*="logo"]');
+    for (const container of headerEls) {
+        const allEls = container.querySelectorAll('*');
+        for (const el of allEls) {
+            const style = window.getComputedStyle(el);
+            const bgImg = style.backgroundImage;
+            if (bgImg && bgImg !== 'none') {
+                const urlMatch = bgImg.match(/url\\(["']?(https?:\\/\\/.+?)["']?\\)/);
+                if (urlMatch) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 20 && rect.height > 10) {
+                        addLogo(urlMatch[1], '', rect.width, rect.height, 'CSS background-image in header');
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Check <input type="image"> (some sites use this for logos)
+    const inputImgs = document.querySelectorAll('input[type="image"]');
+    for (const inp of inputImgs) {
+        const src = inp.src || '';
+        if (!src || src.startsWith('data:')) continue;
+        const rect = inp.getBoundingClientRect();
+        if (rect.top < 80) {
+            addLogo(src, inp.alt, rect.width, rect.height, 'input[type=image] near top');
+        }
+    }
+
+    // 4. Check <a> elements with background-image that link to homepage
+    const links = document.querySelectorAll('a[href="/"], a[href="#"]');
+    for (const a of links) {
+        const style = window.getComputedStyle(a);
+        const bgImg = style.backgroundImage;
+        if (bgImg && bgImg !== 'none') {
+            const urlMatch = bgImg.match(/url\\(["']?(https?:\\/\\/.+?)["']?\\)/);
+            if (urlMatch) {
+                const rect = a.getBoundingClientRect();
+                if (rect.width > 20 && rect.height > 10) {
+                    addLogo(urlMatch[1], '', rect.width, rect.height, 'homepage link with background-image');
+                }
+            }
         }
     }
 
@@ -532,11 +577,36 @@ async def scrape_and_capture(url: str) -> dict:
     computed styles, font/icon links, rendered SVGs, logos.
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-infobars",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+            ],
         )
+        context = await browser.new_context(
+            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="America/New_York",
+            color_scheme="light",
+            java_script_enabled=True,
+        )
+        stealth = Stealth(
+            navigator_webdriver=True,
+            chrome_runtime=True,
+            navigator_plugins=True,
+            navigator_permissions=True,
+            webgl_vendor=True,
+        )
+        await stealth.apply_stealth_async(context)
+        page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
 
@@ -571,28 +641,99 @@ async def scrape_and_capture(url: str) -> dict:
         # Extract logo images (position + ancestor based)
         try:
             logos = await page.evaluate(EXTRACT_LOGO_IMAGES_JS)
+            for logo in logos:
+                logger.info(f"  Logo detected: {logo.get('url', '?')[:100]} ({logo.get('width')}x{logo.get('height')}, reason={logo.get('reason')})")
         except Exception as e:
             logger.warning(f"Logo extraction failed: {e}")
             logos = []
 
-        # Get total page height (before clicking, which might change layout)
-        total_height = await page.evaluate("document.body.scrollHeight")
+        # Get total page height — handle SPAs where body.scrollHeight is 0
+        # by finding the actual scrollable container
+        scroll_info = await page.evaluate("""
+        () => {
+            // Strategy 1: body.scrollHeight (works for most sites)
+            let height = document.body.scrollHeight;
+            let scrollTarget = 'window';
 
-        # Take viewport-sized screenshots scrolling top to bottom (capped)
+            // Strategy 2: if body height is tiny, find the real scrollable container
+            if (height <= window.innerHeight) {
+                // Check document.documentElement
+                const docHeight = document.documentElement.scrollHeight;
+                if (docHeight > height) {
+                    height = docHeight;
+                }
+
+                // Still too small? Find the largest scrollable child
+                if (height <= window.innerHeight) {
+                    const candidates = document.querySelectorAll('main, [role="main"], #content, #app, #root, [class*="content"], [class*="scroll"]');
+                    let bestEl = null;
+                    let bestHeight = 0;
+                    // Check explicit candidates first
+                    for (const el of candidates) {
+                        if (el.scrollHeight > bestHeight) {
+                            bestHeight = el.scrollHeight;
+                            bestEl = el;
+                        }
+                    }
+                    // Also check all direct children of body and common wrappers
+                    const wrappers = [...document.body.children, ...document.querySelectorAll('body > * > *')];
+                    for (const el of wrappers) {
+                        const style = window.getComputedStyle(el);
+                        const isScrollable = style.overflow === 'auto' || style.overflow === 'scroll'
+                            || style.overflowY === 'auto' || style.overflowY === 'scroll';
+                        if (el.scrollHeight > bestHeight && (isScrollable || el.scrollHeight > window.innerHeight)) {
+                            bestHeight = el.scrollHeight;
+                            bestEl = el;
+                        }
+                    }
+                    if (bestEl && bestHeight > height) {
+                        // Tag it so we can scroll it later
+                        bestEl.setAttribute('data-clone-scroll', 'true');
+                        height = bestHeight;
+                        scrollTarget = 'element';
+                    }
+                }
+            }
+
+            return { height: Math.max(height, window.innerHeight), scrollTarget };
+        }
+        """)
+        total_height = scroll_info["height"]
+        scroll_target = scroll_info["scrollTarget"]
+        logger.info(f"Page height: {total_height}px (scroll target: {scroll_target})")
+
+        # Build scroll JS based on whether we scroll window or a container element
+        if scroll_target == "element":
+            scroll_js = "(y) => { const el = document.querySelector('[data-clone-scroll]'); if (el) el.scrollTop = y; else window.scrollTo(0, y); }"
+        else:
+            scroll_js = "(y) => window.scrollTo(0, y)"
+
+        # Take viewport screenshots evenly spaced to cover the full page
         screenshots_b64 = []
-        scroll_y = 0
-        while scroll_y < total_height and len(screenshots_b64) < MAX_SCREENSHOTS:
-            await page.evaluate(f"window.scrollTo(0, {scroll_y})")
-            await page.wait_for_timeout(300)
-            screenshot_bytes = await page.screenshot(type="png")
-            screenshots_b64.append(_resize_screenshot(screenshot_bytes))
-            scroll_y += VIEWPORT_HEIGHT
-        if total_height > VIEWPORT_HEIGHT * MAX_SCREENSHOTS:
-            logger.info(f"Capped at {MAX_SCREENSHOTS} screenshots (page height: {total_height}px)")
+        scroll_positions = []
+        viewports_needed = max(1, -(-total_height // VIEWPORT_HEIGHT))  # ceil division
+        num_screenshots = min(MAX_SCREENSHOTS, viewports_needed)
+        # Stride: for short pages use viewport height (no gaps),
+        # for tall pages space evenly so all sections are captured
+        if num_screenshots <= 1:
+            stride = 0
+        elif viewports_needed <= MAX_SCREENSHOTS:
+            stride = VIEWPORT_HEIGHT  # page fits within cap — no gaps
+        else:
+            # Distribute evenly: last screenshot anchored to bottom
+            stride = (total_height - VIEWPORT_HEIGHT) / (num_screenshots - 1)
+        for i in range(num_screenshots):
+            scroll_y = min(int(i * stride), max(0, total_height - VIEWPORT_HEIGHT))
+            await page.evaluate(scroll_js, scroll_y)
+            await page.wait_for_timeout(400)
+            vp_bytes = await page.screenshot(type="png")
+            screenshots_b64.append(_resize_screenshot(vp_bytes))
+            scroll_positions.append(scroll_y)
+        logger.info(f"{num_screenshots} viewport screenshots captured (page height: {total_height}px, stride: {stride:.0f}px, positions: {scroll_positions})")
 
         # Detect interactive toggle relationships by clicking buttons
         # Done AFTER screenshots so clicks don't affect the visual captures
-        await page.evaluate("window.scrollTo(0, 0)")
+        await page.evaluate(scroll_js, 0)
         await page.wait_for_timeout(300)
         interactive_result = await _detect_interactives(page)
         interactives = interactive_result["toggles"]
@@ -618,6 +759,8 @@ async def scrape_and_capture(url: str) -> dict:
     return {
         "html": cleaned_html,
         "screenshots": screenshots_b64,
+        "scroll_positions": scroll_positions,
+        "total_height": total_height,
         "image_urls": image_urls,
         "styles": styles,
         "font_links": font_links,

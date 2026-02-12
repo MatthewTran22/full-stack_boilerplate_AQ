@@ -4,24 +4,24 @@
 
 @layer base {
   :root {
-    --background: 220 13% 4%;
-    --foreground: 210 20% 95%;
-    --card: 220 13% 7%;
-    --card-foreground: 210 20% 95%;
-    --primary: 210 100% 60%;
-    --primary-foreground: 220 13% 4%;
-    --secondary: 220 10% 14%;
-    --secondary-foreground: 210 20% 85%;
-    --muted: 220 10% 12%;
-    --muted-foreground: 215 14% 55%;
-    --accent: 210 100% 60%;
-    --accent-foreground: 220 13% 4%;
-    --destructive: 0 72% 51%;
+    --background: 0 0% 7%;
+    --foreground: 0 0% 95%;
+    --card: 0 0% 10%;
+    --card-foreground: 0 0% 95%;
+    --primary: 38 100% 58%;
+    --primary-foreground: 0 0% 5%;
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 0 0% 80%;
+    --muted: 0 0% 12%;
+    --muted-foreground: 0 0% 55%;
+    --accent: 38 100% 58%;
+    --accent-foreground: 0 0% 5%;
+    --destructive: 0 72% 55%;
     --destructive-foreground: 0 0% 98%;
-    --border: 220 10% 16%;
-    --input: 220 10% 16%;
-    --ring: 210 100% 60%;
-    --radius: 0.75rem;
+    --border: 0 0% 18%;
+    --input: 0 0% 18%;
+    --ring: 38 100% 58%;
+    --radius: 0.5rem;
   }
 }
 
@@ -30,10 +30,143 @@
     @apply border-border;
   }
   body {
+    font-family: 'Satoshi', system-ui, -apple-system, sans-serif;
     @apply bg-background text-foreground antialiased;
   }
 }
 
+/* ── Grain overlay ── */
+.grain::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.022;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 128px 128px;
+}
+
+/* ── Dot grid background ── */
+.dot-grid {
+  background-image: radial-gradient(circle, hsla(0, 0%, 100%, 0.13) 1px, transparent 1px);
+  background-size: 24px 24px;
+  mask-image: radial-gradient(ellipse 60% 50% at 50% 40%, black 20%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse 60% 50% at 50% 40%, black 20%, transparent 70%);
+}
+
+/* ── Animated grid lines ── */
+.grid-lines {
+  background-image:
+    linear-gradient(to right, hsla(0, 0%, 100%, 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, hsla(0, 0%, 100%, 0.06) 1px, transparent 1px);
+  background-size: 60px 60px;
+  mask-image: radial-gradient(ellipse 50% 60% at 50% 30%, black 10%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse 50% 60% at 50% 30%, black 10%, transparent 70%);
+}
+
+/* ── Border beam — animated conic gradient border ── */
+@property --border-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes border-rotate {
+  to { --border-angle: 360deg; }
+}
+
+.border-beam {
+  position: relative;
+  overflow: hidden;
+  border-radius: 0.75rem;
+}
+
+.border-beam::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(
+    from var(--border-angle),
+    transparent 40%,
+    hsla(38, 100%, 58%, 0.65) 50%,
+    transparent 60%
+  );
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  -webkit-mask-composite: xor;
+  animation: border-rotate 4s linear infinite;
+  pointer-events: none;
+}
+
+/* Focused state — brighter beam */
+.border-beam-focus::before {
+  background: conic-gradient(
+    from var(--border-angle),
+    transparent 30%,
+    hsla(38, 100%, 55%, 0.8) 48%,
+    hsl(38, 100%, 70%) 50%,
+    hsla(38, 100%, 55%, 0.8) 52%,
+    transparent 70%
+  );
+  animation: border-rotate 3s linear infinite;
+}
+
+/* ── Gradient card border on hover ── */
+.gradient-card {
+  position: relative;
+  overflow: hidden;
+  border-radius: 0.5rem;
+  transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.gradient-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(
+    from var(--border-angle, 0deg),
+    transparent 60%,
+    hsla(38, 100%, 58%, 0.45) 75%,
+    hsla(38, 100%, 65%, 0.65) 80%,
+    transparent 90%
+  );
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  -webkit-mask-composite: xor;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  animation: border-rotate 6s linear infinite;
+  pointer-events: none;
+}
+
+.gradient-card:hover::before {
+  opacity: 1;
+}
+
+.gradient-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px -12px hsla(38, 100%, 58%, 0.14);
+}
+
+/* ── Logo glow ── */
+@keyframes logo-breathe {
+  0%, 100% { filter: drop-shadow(0 0 24px hsla(38, 100%, 58%, 0.3)) drop-shadow(0 0 60px hsla(38, 100%, 58%, 0.08)); }
+  50% { filter: drop-shadow(0 0 48px hsla(38, 100%, 58%, 0.5)) drop-shadow(0 0 90px hsla(38, 100%, 58%, 0.15)); }
+}
+
+.logo-glow {
+  animation: logo-breathe 4s ease-in-out infinite;
+}
+
+/* ── Shimmer ── */
 @keyframes shimmer {
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
@@ -50,6 +183,7 @@
   animation: shimmer 1.5s ease-in-out infinite;
 }
 
+/* ── Pulse ring ── */
 @keyframes pulse-ring {
   0% { transform: scale(0.8); opacity: 1; }
   100% { transform: scale(2.2); opacity: 0; }
@@ -57,4 +191,48 @@
 
 .animate-pulse-ring {
   animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(0 0% 22%);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(0 0% 32%);
+}
+
+/* ── Spotlight mouse-follow (set via JS on .spotlight-container) ── */
+.spotlight-container {
+  --mouse-x: 50%;
+  --mouse-y: 40%;
+}
+
+.spotlight {
+  background: radial-gradient(
+    600px circle at var(--mouse-x) var(--mouse-y),
+    hsla(38, 100%, 58%, 0.07),
+    transparent 60%
+  );
+  transition: background 0.3s ease;
+}
+
+/* ── Input glow ring animation ── */
+@keyframes input-glow {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 36px -6px hsla(38, 100%, 58%, 0.22); }
+}
+
+.input-glow-idle {
+  animation: input-glow 3s ease-in-out infinite;
 }

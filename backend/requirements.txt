@@ -5,6 +5,7 @@ python-dotenv
 httpx
 beautifulsoup4
 playwright
+playwright-stealth
 Pillow
 numpy
 openai

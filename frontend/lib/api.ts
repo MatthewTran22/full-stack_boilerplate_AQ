@@ -21,6 +21,15 @@ export interface CloneFile {
   lines: number;
 }
 
+export interface CloneUsage {
+  tokens_in: number;
+  tokens_out: number;
+  total_cost: number;
+  api_calls: number;
+  model: string;
+  duration_s: number;
+}
+
 export interface CloneEvent {
   status: string;
   message?: string;
@@ -28,6 +37,7 @@ export interface CloneEvent {
   clone_id?: string;
   files?: CloneFile[];
   scaffold_paths?: string[];
+  usage?: CloneUsage;
   // file_write event fields
   type?: string;
   file?: string;
@@ -35,6 +45,10 @@ export interface CloneEvent {
   lines?: number;
   // screenshot event
   screenshot?: string;
+  // section_complete event fields
+  section?: number;
+  total?: number;
+  components?: string[];
 }
 
 // 5 minute timeout for the entire SSE stream
