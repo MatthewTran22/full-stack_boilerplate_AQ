@@ -35,6 +35,7 @@ async def save_clone(
     screenshot_url: Optional[str] = None,
     sandbox_url: Optional[str] = None,
     preview_url: Optional[str] = None,
+    clone_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Save a clone record to the database."""
     client = get_supabase()
@@ -47,6 +48,8 @@ async def save_clone(
             "screenshot_url": screenshot_url,
             "sandbox_url": sandbox_url,
         }
+        if clone_id is not None:
+            row["id"] = clone_id
         if preview_url is not None:
             row["preview_url"] = preview_url
         result = (
@@ -220,3 +223,49 @@ def get_public_storage_url(clone_id: str, path: str) -> str:
     """Get the public URL for a file in Supabase Storage."""
     supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
     return f"{supabase_url}/storage/v1/object/public/{STORAGE_BUCKET}/{clone_id}/{path}"
+
+
+def list_storage_files(clone_id: str) -> list[dict]:
+    """List and download all source files for a clone from Supabase Storage.
+
+    Returns [{"path": "app/page.tsx", "content": "...", "lines": 42}, ...].
+    """
+    client = get_supabase()
+    if client is None:
+        return []
+
+    bucket = client.storage.from_(STORAGE_BUCKET)
+    try:
+        file_list = bucket.list(clone_id)
+    except Exception as e:
+        logger.error(f"Failed to list storage files for {clone_id}: {e}")
+        return []
+
+    results = []
+
+    def _walk(prefix: str, items: list):
+        for item in items:
+            name = item.get("name", "")
+            item_id = item.get("id")
+            if item_id is None:
+                # It's a folder — recurse
+                sub_prefix = f"{prefix}/{name}" if prefix else name
+                try:
+                    sub_items = bucket.list(f"{clone_id}/{sub_prefix}")
+                    _walk(sub_prefix, sub_items)
+                except Exception:
+                    pass
+            else:
+                # It's a file — download it
+                rel_path = f"{prefix}/{name}" if prefix else name
+                storage_path = f"{clone_id}/{rel_path}"
+                try:
+                    data = bucket.download(storage_path)
+                    content = data.decode("utf-8", errors="replace")
+                    lines = content.count("\n") + 1
+                    results.append({"path": rel_path, "content": content, "lines": lines})
+                except Exception as e:
+                    logger.debug(f"Failed to download {storage_path}: {e}")
+
+    _walk("", file_list)
+    return results

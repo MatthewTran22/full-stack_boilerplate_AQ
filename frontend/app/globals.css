@@ -166,6 +166,39 @@
   animation: logo-breathe 4s ease-in-out infinite;
 }
 
+/* ── Logo pulse by stage color (smooth hue transition) ── */
+@property --pulse-h {
+  syntax: "<number>";
+  initial-value: 145;
+  inherits: false;
+}
+
+@property --pulse-s {
+  syntax: "<number>";
+  initial-value: 80;
+  inherits: false;
+}
+
+@keyframes logo-pulse-stage {
+  0%, 100% {
+    filter:
+      drop-shadow(0 0 20px hsla(var(--pulse-h), calc(var(--pulse-s) * 1%), 50%, 0.35))
+      drop-shadow(0 0 50px hsla(var(--pulse-h), calc(var(--pulse-s) * 1%), 50%, 0.1));
+    transform: scale(1);
+  }
+  50% {
+    filter:
+      drop-shadow(0 0 40px hsla(var(--pulse-h), calc(var(--pulse-s) * 1%), 50%, 0.6))
+      drop-shadow(0 0 80px hsla(var(--pulse-h), calc(var(--pulse-s) * 1%), 50%, 0.2));
+    transform: scale(1.04);
+  }
+}
+
+.logo-pulse-stage {
+  animation: logo-pulse-stage 2s ease-in-out infinite;
+  transition: --pulse-h 1.5s ease, --pulse-s 1.5s ease;
+}
+
 /* ── Shimmer ── */
 @keyframes shimmer {
   0% { background-position: -200% 0; }
@@ -299,9 +332,15 @@
   50% { box-shadow: 0 0 50px hsla(0, 85%, 58%, 0.5), 0 0 100px hsla(0, 85%, 58%, 0.2), inset 0 0 30px hsla(0, 85%, 58%, 0.1); }
 }
 
+@keyframes cpu-breathe-blue {
+  0%, 100% { box-shadow: 0 0 30px hsla(210, 85%, 55%, 0.3), 0 0 60px hsla(210, 85%, 55%, 0.1), inset 0 0 20px hsla(210, 85%, 55%, 0.05); }
+  50% { box-shadow: 0 0 50px hsla(210, 85%, 55%, 0.5), 0 0 100px hsla(210, 85%, 55%, 0.2), inset 0 0 30px hsla(210, 85%, 55%, 0.1); }
+}
+
 .cpu-core-green { animation: cpu-breathe-green 3s ease-in-out infinite; }
 .cpu-core-yellow { animation: cpu-breathe-yellow 3s ease-in-out infinite; }
 .cpu-core-red { animation: cpu-breathe-red 3s ease-in-out infinite; }
+.cpu-core-blue { animation: cpu-breathe-blue 3s ease-in-out infinite; }
 
 /* ── PCB grid background ── */
 .pcb-grid {
@@ -370,3 +409,8 @@
 .aurora-red.aurora-band-1 { background: linear-gradient(90deg, transparent, hsla(0, 85%, 58%, 0.14), hsla(350, 80%, 55%, 0.08), transparent); }
 .aurora-red.aurora-band-2 { background: linear-gradient(90deg, transparent, hsla(10, 90%, 55%, 0.11), hsla(340, 75%, 60%, 0.07), transparent); }
 .aurora-red.aurora-band-3 { background: linear-gradient(90deg, transparent, hsla(15, 85%, 50%, 0.09), hsla(0, 80%, 55%, 0.06), transparent); }
+
+/* Blue — loading/rebuilding */
+.aurora-blue.aurora-band-1 { background: linear-gradient(90deg, transparent, hsla(210, 85%, 55%, 0.14), hsla(220, 80%, 50%, 0.08), transparent); }
+.aurora-blue.aurora-band-2 { background: linear-gradient(90deg, transparent, hsla(200, 90%, 50%, 0.11), hsla(230, 75%, 55%, 0.07), transparent); }
+.aurora-blue.aurora-band-3 { background: linear-gradient(90deg, transparent, hsla(215, 85%, 48%, 0.09), hsla(205, 80%, 55%, 0.06), transparent); }

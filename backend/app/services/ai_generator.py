@@ -11,9 +11,8 @@ logger = logging.getLogger(__name__)
 MODEL_PRICING = {
     "anthropic/claude-sonnet-4.5": {"input": 3.00, "output": 15.00},
     "anthropic/claude-sonnet-4": {"input": 3.00, "output": 15.00},
-    "google/gemini-2.5-pro": {"input": 1.25, "output": 10.00},
 }
-DEFAULT_PRICING = {"input": 1.25, "output": 10.00}
+DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
 
 
 def _extract_usage(response) -> dict:

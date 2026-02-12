@@ -9,6 +9,8 @@ logger = logging.getLogger(__name__)
 # ── In-memory stores ──
 _sandbox_instances: dict[str, object] = {}
 _sandbox_project_dirs: dict[str, str] = {}
+# clone_id → Daytona sandbox ID (persists even if object is lost)
+_sandbox_id_map: dict[str, str] = {}
 
 # Daytona hard limit on concurrent sandboxes
 DAYTONA_MAX_SANDBOXES = int(os.getenv("DAYTONA_MAX_SANDBOXES", "10"))
@@ -61,6 +63,7 @@ async def setup_sandbox_shell(
         _sandbox_project_dirs[clone_id] = project_dir
 
         sandbox_id = getattr(sandbox, "id", "unknown")
+        _sandbox_id_map[clone_id] = sandbox_id
         logger.info(f"[sandbox:{clone_id}] Created sandbox {sandbox_id} in {t_create:.1f}s")
 
         if on_status:
@@ -262,12 +265,16 @@ async def cleanup_sandbox(clone_id: str) -> None:
 
     sandbox = _sandbox_instances.pop(clone_id, None)
     _sandbox_project_dirs.pop(clone_id, None)
+    sandbox_id = _sandbox_id_map.pop(clone_id, None)
 
-    if not sandbox:
-        logger.info(f"[sandbox:{clone_id}] No sandbox instance to clean up")
+    # Get the Daytona sandbox ID from either the object or the ID map
+    if sandbox and not sandbox_id:
+        sandbox_id = getattr(sandbox, "id", None)
+
+    if not sandbox_id:
+        logger.info(f"[sandbox:{clone_id}] No sandbox ID found to clean up")
         return
 
-    sandbox_id = getattr(sandbox, "id", "unknown")
     try:
         from daytona_sdk import Daytona, DaytonaConfig
 
@@ -275,7 +282,7 @@ async def cleanup_sandbox(clone_id: str) -> None:
         config = DaytonaConfig(api_key=api_key, api_url=api_url)
         daytona = Daytona(config)
         sb = daytona.get(sandbox_id)
-        sb.delete()
+        daytona.delete(sb)
         logger.info(f"[sandbox:{clone_id}] Deleted Daytona sandbox {sandbox_id}")
     except Exception as e:
         logger.error(f"[sandbox:{clone_id}] Failed to delete sandbox {sandbox_id}: {e}")

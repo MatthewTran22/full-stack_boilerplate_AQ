@@ -3,7 +3,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import { motion, AnimatePresence } from "framer-motion";
-import { startClone, getClones, getPreviewUrl, resolveApiUrl, endSandbox, getBeaconEndUrl, type CloneHistoryItem, type CloneFile, type CloneEvent, type CloneUsage } from "@/lib/api";
+import JSZip from "jszip";
+import { startClone, getClones, getCloneFiles, getPreviewUrl, resolveApiUrl, endSandbox, getBeaconEndUrl, type CloneHistoryItem, type CloneFile, type CloneEvent, type CloneUsage } from "@/lib/api";
 import {
   Globe,
   Loader2,
@@ -30,6 +31,7 @@ import {
   PanelLeftOpen,
   Folder,
   Plus,
+  Download,
 } from "lucide-react";
 
 // ── Brand Logo (SVG) ──
@@ -87,7 +89,7 @@ const fadeIn = {
   visible: { opacity: 1, transition: { duration: 0.5 } },
 };
 
-type CloneStatus = "idle" | "scraping" | "generating" | "deploying" | "done" | "error";
+type CloneStatus = "idle" | "scraping" | "generating" | "deploying" | "loading" | "done" | "error";
 
 type LogEntry = MessageLogEntry | FileLogEntry | ScreenshotLogEntry | SectionLogEntry | UploadLogEntry;
 
@@ -176,6 +178,7 @@ export default function Home() {
   const [sectionsComplete, setSectionsComplete] = useState<Set<number>>(new Set());
   const [elapsed, setElapsed] = useState(0);
   const [inputFocused, setInputFocused] = useState(false);
+  const [backgrounded, setBackgrounded] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const logIdRef = useRef(0);
@@ -250,12 +253,15 @@ export default function Home() {
 
   const handleClone = async () => {
     if (!url.trim()) return;
+    // Don't allow starting a new clone while one is in progress
+    if (isLoading) return;
     let targetUrl = url.trim();
     if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
 
     // Clean up previous sandbox before starting new clone
     if (cloneIdRef.current) endSandbox(cloneIdRef.current);
 
+    setBackgrounded(false);
     setStatus("scraping");
     setCloneId(null);
     cloneIdRef.current = null;
@@ -284,14 +290,20 @@ export default function Home() {
         if (data.status === "file_write") {
           if (data.file && data.lines) addFileLog(data.file, data.lines);
         } else if (data.status === "screenshot") {
-          if (data.screenshot) {
-            const id = ++logIdRef.current;
+          const imgs: string[] = data.screenshots ?? (data.screenshot ? [data.screenshot] : []);
+          if (imgs.length) {
             setLogEntries((prev) => {
               const updated = prev.map((e) => e.kind === "message" && e.status === "active" ? { ...e, status: "done" as const } : e);
-              return [...updated, { kind: "screenshot" as const, id, src: `data:image/png;base64,${data.screenshot}`, timestamp: new Date() }];
+              const newEntries = imgs.map((s) => ({
+                kind: "screenshot" as const,
+                id: ++logIdRef.current,
+                src: `data:image/png;base64,${s}`,
+                timestamp: new Date(),
+              }));
+              return [...updated, ...newEntries];
             });
           }
-          addMessageLog("camera", "Screenshot captured", "done");
+          addMessageLog("camera", `${imgs.length} screenshot${imgs.length !== 1 ? "s" : ""} captured`, "done");
         } else if (data.status === "file_upload") {
           const uploadFile = data.file || (data.message || "").replace(/^Uploaded\s+/, "");
           const uid = ++logIdRef.current;
@@ -363,20 +375,52 @@ export default function Home() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleHistoryClick = (item: CloneHistoryItem) => {
+  const handleExportZip = async () => {
+    if (!generatedFiles.length) return;
+    const zip = new JSZip();
+    for (const file of generatedFiles) {
+      zip.file(file.path, file.content);
+    }
+    const blob = await zip.generateAsync({ type: "blob" });
+    const domain = url.replace(/^https?:\/\//, "").replace(/[/\\?#:]/g, "_").replace(/_+$/, "") || "clone";
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${domain}-clone.zip`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const handleHistoryClick = async (item: CloneHistoryItem) => {
     if (cloneIdRef.current) endSandbox(cloneIdRef.current);
-    const previewLink = item.preview_url?.includes("/api/static/") ? resolveApiUrl(item.preview_url) : getPreviewUrl(item.id);
-    setPreviewUrl(previewLink);
-    setStatus("done");
+    setStatus("loading");
     setUrl(item.url);
-    setCloneId(null);
-    cloneIdRef.current = null;
+    setCloneId(item.id);
+    cloneIdRef.current = item.id;
+    setPreviewUrl(null);
     setGeneratedFiles([]);
+    setLogEntries([]);
+    // Fetch files and preview in parallel
+    const previewLink = item.preview_url?.includes("/api/static/") ? resolveApiUrl(item.preview_url) : getPreviewUrl(item.id);
+    const files = await getCloneFiles(item.id);
+    setGeneratedFiles(files);
+    if (files.length > 0) setActiveFile(files[0].path);
+    setPreviewUrl(previewLink);
     setLogEntries([{ kind: "message", id: 1, icon: "done", message: "Loaded from history", timestamp: new Date(), status: "done" }]);
+    setStatus("done");
+  };
+
+  const goHome = () => {
+    const active = status === "scraping" || status === "generating" || status === "deploying";
+    if (active) {
+      setBackgrounded(true);
+    } else {
+      reset();
+    }
   };
 
   const reset = () => {
     if (cloneIdRef.current) endSandbox(cloneIdRef.current);
+    setBackgrounded(false);
     setStatus("idle");
     setUrl("");
     setCloneId(null);
@@ -402,9 +446,9 @@ export default function Home() {
     return `${Math.floor(hrs / 24)}d ago`;
   };
 
-  const isLoading = status === "scraping" || status === "generating" || status === "deploying";
+  const isLoading = status === "scraping" || status === "generating" || status === "deploying" || status === "loading";
   const hasResult = status === "done" && (previewUrl || generatedFiles.length > 0);
-  const showWorkspace = isLoading || hasResult || status === "error";
+  const showWorkspace = !backgrounded && (isLoading || hasResult || status === "error");
   const currentFileContent = generatedFiles.find((f) => f.path === activeFile)?.content || "";
 
   // ── Build nested file tree ──
@@ -524,8 +568,38 @@ export default function Home() {
           className={`relative z-10 flex-1 flex flex-col items-center px-6 ${history.length > 0 ? "pt-8" : "justify-center"}`}
         >
           <motion.div variants={fadeUp} className="mb-10 text-center">
-            <div className="inline-block mb-8 logo-glow">
-              <ClonrLogo size={72} />
+            <div
+              className={`inline-block mb-8 ${backgrounded ? "cursor-pointer" : "logo-glow"}`}
+              onClick={backgrounded ? () => setBackgrounded(false) : undefined}
+            >
+              <div
+                className={`relative ${backgrounded ? "logo-pulse-stage" : ""}`}
+                style={backgrounded ? {
+                  '--pulse-h': status === "scraping" ? 145 : status === "generating" ? 45 : status === "deploying" ? 0 : status === "done" ? 145 : 0,
+                  '--pulse-s': status === "scraping" ? 80 : status === "generating" ? 100 : status === "deploying" ? 85 : status === "done" ? 80 : 85,
+                } as React.CSSProperties : undefined}
+              >
+                <ClonrLogo size={72} />
+                {backgrounded && (
+                  <div className="absolute -bottom-7 left-1/2 -translate-x-1/2 whitespace-nowrap text-center">
+                    {isLoading && (
+                      <span className={`text-[10px] font-mono tracking-wide ${status === "scraping" ? "text-emerald-400/70" : status === "deploying" ? "text-red-400/70" : "text-amber-400/70"}`}>
+                        {status === "scraping" ? "scraping" : status === "generating" ? "generating" : "deploying"}...
+                      </span>
+                    )}
+                    {status === "done" && (
+                      <span className="text-[10px] font-mono tracking-wide text-emerald-400/80">
+                        done — click to view
+                      </span>
+                    )}
+                    {status === "error" && (
+                      <span className="text-[10px] font-mono tracking-wide text-red-400/80">
+                        failed — click to view
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
 
             <motion.h1
@@ -560,10 +634,10 @@ export default function Home() {
                 />
                 <button
                   type="submit"
-                  disabled={!url.trim()}
+                  disabled={!url.trim() || (backgrounded && isLoading)}
                   className="shrink-0 bg-white text-black rounded-lg px-4 py-2 text-xs font-semibold hover:bg-white/90 disabled:opacity-20 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-2 tracking-wide uppercase"
                 >
-                  Clone
+                  {backgrounded && isLoading ? "Running..." : "Clone"}
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -665,7 +739,7 @@ export default function Home() {
     <main className="grain h-screen flex flex-col bg-background">
       {/* Top bar */}
       <div className="shrink-0 flex items-center gap-3 px-4 py-2 border-b border-[hsl(0,0%,15%)] bg-[hsl(0,0%,8%)]">
-        <button onClick={reset} className="flex items-center gap-2.5 text-sm font-semibold hover:opacity-80 transition-opacity mr-1 tracking-tight">
+        <button onClick={goHome} className="flex items-center gap-2.5 text-sm font-semibold hover:opacity-80 transition-opacity mr-1 tracking-tight">
           <ClonrLogoSmall />
           <span>Clonr</span>
         </button>
@@ -698,10 +772,16 @@ export default function Home() {
                 <ExternalLink className="w-3 h-3" />
               </a>
             )}
+
+            {generatedFiles.length > 0 && (
+              <button onClick={handleExportZip} className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/[0.08] transition-all font-mono">
+                <Download className="w-3 h-3" /> export
+              </button>
+            )}
           </>
         )}
 
-        <button onClick={reset} className="bg-white text-black rounded-md px-3.5 py-1.5 text-xs font-semibold hover:bg-white/90 transition-all flex items-center gap-1.5 tracking-wide uppercase">
+        <button onClick={goHome} className="bg-white text-black rounded-md px-3.5 py-1.5 text-xs font-semibold hover:bg-white/90 transition-all flex items-center gap-1.5 tracking-wide uppercase">
           <Plus className="w-3 h-3" /> New
         </button>
       </div>
@@ -709,12 +789,12 @@ export default function Home() {
       {/* Main workspace */}
       <div className="flex-1 flex overflow-hidden relative">
         {/* Left: Activity log */}
-        {!sidebarOpen && (
+        {!sidebarOpen && status !== "loading" && (
           <button onClick={() => setSidebarOpen(true)} className="absolute left-2 top-3 z-20 p-1.5 rounded-md bg-[hsl(0,0%,12%)] border border-[hsl(0,0%,20%)] hover:bg-[hsl(0,0%,16%)] transition-colors" title="Show activity">
             <PanelLeftOpen className="w-3.5 h-3.5 text-muted-foreground" />
           </button>
         )}
-        <div className={`shrink-0 border-r border-[hsl(0,0%,15%)] bg-[hsl(0,0%,8%)] flex flex-col z-10 transition-all duration-200 ${sidebarOpen ? "w-80" : "w-0 overflow-hidden border-r-0"}`}>
+        <div className={`shrink-0 border-r border-[hsl(0,0%,15%)] bg-[hsl(0,0%,8%)] flex flex-col z-10 transition-all duration-200 ${sidebarOpen && status !== "loading" ? "w-80" : "w-0 overflow-hidden border-r-0"}`}>
           <div className="px-4 py-3 border-b border-[hsl(0,0%,15%)] flex items-center justify-between">
             <h2 className="text-xs font-semibold flex items-center gap-2 uppercase tracking-[0.1em] text-muted-foreground">
               <Sparkles className="w-3.5 h-3.5 text-primary" /> Activity
@@ -1037,15 +1117,18 @@ export default function Home() {
                                 <span className="text-[10px] text-muted-foreground/45 flex-1 min-w-0 truncate font-mono">{entry.message}</span>
                               </div>
                             ))}
-                            {screenshots.map((s) => (
-                              <div key={s.id} className="mt-1.5">
-                                <img
-                                  src={s.src} alt="Screenshot"
-                                  className="w-full max-w-[200px] rounded-md border border-[hsl(0,0%,15%)] cursor-pointer hover:border-primary/30 hover:shadow-lg hover:shadow-primary/5 transition-all duration-200 object-cover"
-                                  onClick={() => setExpandedScreenshot(s.src)}
-                                />
+                            {screenshots.length > 0 && (
+                              <div className="mt-1.5 flex gap-1.5 flex-wrap">
+                                {screenshots.map((s) => (
+                                  <img
+                                    key={s.id}
+                                    src={s.src} alt="Screenshot"
+                                    className="w-[30%] max-w-[140px] rounded-md border border-[hsl(0,0%,15%)] cursor-pointer hover:border-primary/30 hover:shadow-lg hover:shadow-primary/5 transition-all duration-200 object-cover"
+                                    onClick={() => setExpandedScreenshot(s.src)}
+                                  />
+                                ))}
                               </div>
-                            ))}
+                            )}
                             {files.length > 0 && (
                               <div className="mt-1.5 space-y-px rounded-md overflow-hidden">
                                 {files.map((f) => (
@@ -1081,13 +1164,15 @@ export default function Home() {
                   ? "radial-gradient(circle at 50% 45%, hsla(145, 80%, 50%, 0.1) 0%, hsla(160, 90%, 45%, 0.04) 25%, transparent 60%)"
                   : status === "deploying"
                   ? "radial-gradient(circle at 50% 45%, hsla(0, 85%, 58%, 0.1) 0%, hsla(350, 80%, 55%, 0.04) 25%, transparent 60%)"
+                  : status === "loading"
+                  ? "radial-gradient(circle at 50% 45%, hsla(210, 85%, 55%, 0.1) 0%, hsla(220, 80%, 50%, 0.04) 25%, transparent 60%)"
                   : "radial-gradient(circle at 50% 45%, hsla(45, 100%, 55%, 0.1) 0%, hsla(38, 100%, 58%, 0.04) 25%, transparent 60%)",
               }} />
               {/* Animated aurora bands — color-coded by stage */}
               <div className="absolute inset-0 overflow-hidden">
-                <div className={`aurora-band aurora-band-1 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : "aurora-yellow"}`} />
-                <div className={`aurora-band aurora-band-2 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : "aurora-yellow"}`} />
-                <div className={`aurora-band aurora-band-3 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : "aurora-yellow"}`} />
+                <div className={`aurora-band aurora-band-1 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : status === "loading" ? "aurora-blue" : "aurora-yellow"}`} />
+                <div className={`aurora-band aurora-band-2 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : status === "loading" ? "aurora-blue" : "aurora-yellow"}`} />
+                <div className={`aurora-band aurora-band-3 ${status === "scraping" ? "aurora-green" : status === "deploying" ? "aurora-red" : status === "loading" ? "aurora-blue" : "aurora-yellow"}`} />
               </div>
               {/* Vignette */}
               <div className="absolute inset-0" style={{
@@ -1104,6 +1189,7 @@ export default function Home() {
                         scraping:   ["hsl(145, 80%, 50%)", "hsl(160, 90%, 45%)", "hsl(130, 85%, 55%)", "hsl(170, 75%, 48%)", "hsl(140, 95%, 40%)"],
                         generating: ["hsl(45, 100%, 55%)", "hsl(38, 100%, 58%)", "hsl(50, 95%, 50%)", "hsl(32, 100%, 60%)", "hsl(55, 90%, 52%)"],
                         deploying:  ["hsl(0, 85%, 58%)", "hsl(350, 80%, 55%)", "hsl(10, 90%, 55%)", "hsl(340, 75%, 60%)", "hsl(15, 85%, 50%)"],
+                        loading:    ["hsl(210, 85%, 55%)", "hsl(220, 80%, 50%)", "hsl(200, 90%, 50%)", "hsl(230, 75%, 55%)", "hsl(215, 85%, 48%)"],
                       };
                       const colors = palettes[status as keyof typeof palettes] || palettes.generating;
                       return [
@@ -1177,11 +1263,11 @@ export default function Home() {
                     ))}
                   </svg>
                   {/* CPU core — the logo */}
-                  <div className={`relative z-10 w-24 h-24 rounded-2xl bg-[hsl(0,0%,9%)] border border-white/10 flex items-center justify-center transition-shadow duration-1000 ${status === "scraping" ? "cpu-core-green" : status === "deploying" ? "cpu-core-red" : "cpu-core-yellow"}`}>
+                  <div className={`relative z-10 w-24 h-24 rounded-2xl bg-[hsl(0,0%,9%)] border border-white/10 flex items-center justify-center transition-shadow duration-1000 ${status === "scraping" ? "cpu-core-green" : status === "deploying" ? "cpu-core-red" : status === "loading" ? "cpu-core-blue" : "cpu-core-yellow"}`}>
                     <ClonrLogo size={56} className="relative" />
                   </div>
                 </div>
-                <p className="text-muted-foreground/50 text-xs font-mono tracking-wide">building your clone...</p>
+                <p className="text-muted-foreground/50 text-xs font-mono tracking-wide">{status === "loading" ? "loading clone..." : "building your clone..."}</p>
               </div>
             </div>
           )}

@@ -45,6 +45,7 @@ export interface CloneEvent {
   lines?: number;
   // screenshot event
   screenshot?: string;
+  screenshots?: string[];
   // section_complete event fields
   section?: number;
   total?: number;
@@ -131,6 +132,17 @@ export async function getClones(page = 1, perPage = 30): Promise<ClonePaginatedR
 
 export function getPreviewUrl(cloneId: string): string {
   return `${API_URL}/api/preview/${cloneId}`;
+}
+
+export async function getCloneFiles(cloneId: string): Promise<CloneFile[]> {
+  try {
+    const response = await fetch(`${API_URL}/api/clones/${cloneId}/files`);
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.files || [];
+  } catch {
+    return [];
+  }
 }
 
 export async function endSandbox(cloneId: string): Promise<void> {

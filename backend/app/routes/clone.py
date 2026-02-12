@@ -4,6 +4,8 @@ import uuid
 import asyncio
 import logging
 import time
+import ipaddress
+import socket
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, Response
@@ -26,12 +28,33 @@ from app.database import (
     get_clone,
     upload_static_files,
     download_static_file,
+    list_storage_files,
     _guess_content_type,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _is_safe_url(url: str) -> bool:
+    """Block SSRF: reject URLs targeting private/internal networks."""
+    parsed = _urlparse.urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    try:
+        resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    for _family, _type, _proto, _canonname, sockaddr in resolved:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
 
 # ── Concurrency & rate limiting ──
 MAX_CONCURRENT_CLONES = int(os.getenv("MAX_CONCURRENT_CLONES", "5"))
@@ -40,6 +63,11 @@ _clone_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLONES)
 # Simple per-IP rate limiter
 _rate_limit_map: dict[str, float] = {}
 RATE_LIMIT_SECONDS = 10
+
+# Per-IP active clone lock: IP → clone_id (only one clone at a time per user)
+_active_clones: dict[str, str] = {}
+# clone_id → asyncio.Queue for SSE streaming
+_clone_queues: dict[str, asyncio.Queue] = {}
 
 # Map clone_id → (Daytona sandbox preview URL, creation timestamp)
 _sandbox_urls: dict[str, tuple[str, float]] = {}
@@ -141,136 +169,301 @@ async def _check_page_error(dev_url: str, clone_id: str | None = None) -> dict |
 
 
 
+async def _run_clone(clone_id: str, url: str, status_queue: asyncio.Queue, client_ip: str):
+    """Background task that runs the full clone pipeline. Survives SSE disconnect."""
+    logger.info(f"[clone:{clone_id}] Starting clone for {url} (slots={_clone_semaphore._value}/{MAX_CONCURRENT_CLONES})")
+
+    await _clone_semaphore.acquire()
+    try:
+        async def on_status(message):
+            await status_queue.put(message)
+
+        # Step 1: Scrape the website
+        await status_queue.put({"status": "scraping", "message": "Scraping website...", "clone_id": clone_id})
+        t0 = time.time()
+        try:
+            scrape_result = await scrape_and_capture(url)
+            screenshots = scrape_result["screenshots"]
+            html_source = scrape_result["html"]
+            image_urls = scrape_result["image_urls"]
+            scraped_styles = scrape_result.get("styles")
+            font_links = scrape_result.get("font_links", [])
+            scraped_icons = scrape_result.get("icons")
+            scraped_svgs = scrape_result.get("svgs", [])
+            scraped_logos = scrape_result.get("logos", [])
+            scraped_interactives = scrape_result.get("interactives", [])
+            scraped_linked_pages = scrape_result.get("linked_pages", [])
+            scroll_positions = scrape_result.get("scroll_positions", [])
+            scraped_region_types = scrape_result.get("region_types")
+            page_total_height = scrape_result.get("total_height", 0)
+        except Exception as e:
+            logger.error(f"[clone:{clone_id}] Scraping failed for {url}: {e}")
+            await status_queue.put({"status": "error", "message": f"Failed to scrape website: {e}"})
+            return
+        t_scrape = time.time() - t0
+        logger.info(
+            f"[clone:{clone_id}] Scrape complete: {len(screenshots)} screenshots, "
+            f"{len(html_source)} chars HTML, {len(image_urls)} images ({t_scrape:.1f}s)"
+        )
+
+        section_info = f" (scroll positions: {scroll_positions})" if len(scroll_positions) > 1 else ""
+        await status_queue.put({
+            "status": "screenshot",
+            "message": f"Captured {len(screenshots)} viewport screenshots ({t_scrape:.0f}s){section_info}",
+            "screenshots": screenshots,
+        })
+
+        # Step 2: AI generation + sandbox setup IN PARALLEL
+        await status_queue.put({"status": "generating", "message": "AI is generating the clone..."})
+        t1 = time.time()
+
+        all_template_files = get_template_files()
+
+        async def _setup_sandbox():
+            try:
+                return await setup_sandbox_shell(
+                    template_files=all_template_files,
+                    clone_id=clone_id,
+                    on_status=on_status,
+                )
+            except Exception as e:
+                logger.error(f"[clone:{clone_id}] Sandbox setup failed: {e}")
+                return False
+
+        sandbox_task = asyncio.create_task(_setup_sandbox())
+
+        try:
+            ai_result = await generate_clone(
+                html=html_source,
+                screenshots=screenshots,
+                image_urls=image_urls,
+                url=url,
+                styles=scraped_styles,
+                font_links=font_links,
+                icons=scraped_icons,
+                svgs=scraped_svgs,
+                logos=scraped_logos,
+                interactives=scraped_interactives,
+                linked_pages=scraped_linked_pages,
+                scroll_positions=scroll_positions,
+                total_height=page_total_height,
+                region_types=scraped_region_types,
+                on_status=on_status,
+            )
+        except Exception as e:
+            logger.error(f"[clone:{clone_id}] AI generation failed: {e}")
+            sandbox_task.cancel()
+            await status_queue.put({"status": "error", "message": str(e)})
+            return
+
+        files = ai_result["files"]
+        ai_usage = ai_result.get("usage", {})
+        t_ai = time.time() - t1
+        logger.info(f"[clone:{clone_id}] AI generation complete: {len(files)} files ({t_ai:.1f}s)")
+
+        if not files:
+            sandbox_task.cancel()
+            await status_queue.put({"status": "error", "message": "AI returned no files"})
+            return
+
+        # Wait for sandbox to be ready
+        await status_queue.put({"status": "deploying", "message": "Waiting for sandbox..."})
+        t2 = time.time()
+        sandbox_ready = await sandbox_task
+        t_sandbox_wait = time.time() - t2
+        logger.info(f"[clone:{clone_id}] Sandbox ready={sandbox_ready} (waited {t_sandbox_wait:.1f}s)")
+
+        if not sandbox_ready:
+            logger.warning(f"[clone:{clone_id}] No sandbox available")
+            await status_queue.put({"status": "error", "message": "Sandbox unavailable"})
+            return
+
+        # Upload generated files to sandbox
+        await status_queue.put({"status": "deploying", "message": "Uploading generated code to sandbox..."})
+        for f in files:
+            success = upload_file_to_sandbox(clone_id, f["path"], f["content"])
+            if success:
+                await status_queue.put({
+                    "status": "file_upload",
+                    "message": f"Uploaded {f['path']}",
+                    "file": f["path"],
+                })
+            await asyncio.sleep(0.05)
+
+        # Start dev server and get live preview URL
+        await status_queue.put({"status": "deploying", "message": "Starting live preview..."})
+        dev_url = await start_dev_server(clone_id=clone_id, on_status=on_status)
+
+        if not dev_url:
+            logger.warning(f"[clone:{clone_id}] Dev server failed to start")
+            await status_queue.put({"status": "error", "message": "Preview failed to start"})
+            return
+
+        _sandbox_urls[clone_id] = (dev_url, time.time())
+        preview_url = f"/api/sandbox/{clone_id}/"
+        logger.info(f"[clone:{clone_id}] Live preview proxied at {preview_url} → {dev_url}")
+
+        # Auto-fix loop
+        MAX_FIX_RETRIES = 3
+        files_map = {f["path"]: f for f in files}
+
+        for fix_attempt in range(MAX_FIX_RETRIES):
+            await asyncio.sleep(2)
+            error_info = await _check_page_error(dev_url, clone_id)
+            if not error_info:
+                break
+
+            err_file = error_info.get("file", "")
+            err_msg = error_info.get("message", "Unknown error")
+            logger.warning(f"[clone:{clone_id}] Fix attempt {fix_attempt + 1}/{MAX_FIX_RETRIES}: {err_msg} in {err_file}")
+            await status_queue.put({
+                "status": "fixing",
+                "message": f"Fixing error in {err_file} (attempt {fix_attempt + 1}/{MAX_FIX_RETRIES})...",
+            })
+
+            broken_file = files_map.get(err_file)
+            if not broken_file:
+                for path, f in files_map.items():
+                    if err_file.split("/")[-1] in path:
+                        broken_file = f
+                        err_file = path
+                        break
+            if not broken_file:
+                logger.warning(f"[clone:{clone_id}] Could not find {err_file} in generated files, skipping fix")
+                break
+
+            try:
+                fix_result = await fix_component(
+                    file_path=err_file,
+                    file_content=broken_file["content"],
+                    error_message=err_msg,
+                )
+                fixed_content = fix_result["content"]
+                fix_usage = fix_result["usage"]
+
+                ai_usage["tokens_in"] = ai_usage.get("tokens_in", 0) + fix_usage["tokens_in"]
+                ai_usage["tokens_out"] = ai_usage.get("tokens_out", 0) + fix_usage["tokens_out"]
+                ai_usage["api_calls"] = ai_usage.get("api_calls", 0) + 1
+
+                broken_file["content"] = fixed_content
+                upload_file_to_sandbox(clone_id, err_file, fixed_content)
+                logger.info(f"[clone:{clone_id}] Uploaded fix for {err_file}, waiting for hot reload...")
+
+                await status_queue.put({
+                    "status": "file_write", "type": "file_write",
+                    "file": err_file, "action": "fix",
+                    "lines": fixed_content.count("\n") + 1,
+                })
+            except Exception as e:
+                logger.error(f"[clone:{clone_id}] Fix attempt failed: {e}")
+                break
+        else:
+            logger.warning(f"[clone:{clone_id}] Exhausted {MAX_FIX_RETRIES} fix attempts")
+
+        # Recalculate total cost after fixes
+        if ai_usage:
+            from app.services.ai_generator import _calc_cost
+            ai_usage["total_cost"] = _calc_cost(
+                ai_usage.get("tokens_in", 0),
+                ai_usage.get("tokens_out", 0),
+                ai_usage.get("model", "anthropic/claude-sonnet-4.5"),
+            )
+
+        # Persist source files to storage for sandbox re-creation later
+        source_files = {f["path"]: f["content"].encode("utf-8") for f in files}
+        upload_static_files(clone_id, source_files)
+
+        t_total = time.time() - t0
+        total_lines = sum(f["content"].count("\n") + 1 for f in files)
+        cost_str = f", cost=${ai_usage.get('total_cost', 0):.4f}" if ai_usage else ""
+        logger.info(
+            f"[clone:{clone_id}] DONE: {t_total:.1f}s total "
+            f"(scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox_wait={t_sandbox_wait:.1f}s) "
+            f"| {len(files)} files, {total_lines} lines{cost_str}"
+        )
+
+        # Save to DB — use the same clone_id so storage files match the DB record
+        db_record = await save_clone(url=url, preview_url=preview_url, clone_id=clone_id)
+        if db_record:
+            logger.info(f"[clone:{clone_id}] Saved to database")
+
+        file_list = [
+            {"path": f["path"], "content": f["content"], "lines": f["content"].count("\n") + 1}
+            for f in files
+        ]
+        scaffold_paths = sorted(set(tf["path"] for tf in all_template_files))
+
+        await status_queue.put({
+            "status": "done",
+            "message": "Clone complete!",
+            "preview_url": preview_url,
+            "clone_id": clone_id,
+            "files": file_list,
+            "scaffold_paths": scaffold_paths,
+            "usage": ai_usage,
+        })
+
+    except Exception as e:
+        logger.exception(f"[clone:{clone_id}] Unhandled error for {url}")
+        await status_queue.put({"status": "error", "message": str(e)})
+    finally:
+        _clone_semaphore.release()
+        _active_clones.pop(client_ip, None)
+        await status_queue.put({"_done": True})
+        logger.info(f"[clone:{clone_id}] Released slot (slots={_clone_semaphore._value}/{MAX_CONCURRENT_CLONES})")
+
+
 @router.post("/api/clone")
 async def clone_website(request: CloneRequest, raw_request: Request):
-    """Clone a website: scrape, screenshot, generate Next.js files, build static, upload to Supabase Storage."""
+    """Clone a website: scrape, screenshot, generate Next.js files, deploy to sandbox."""
     url = request.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # Rate limit per IP
+    if not _is_safe_url(url):
+        raise HTTPException(status_code=400, detail="Invalid URL: cannot clone internal or private network addresses")
+
     client_ip = raw_request.client.host if raw_request.client else "unknown"
+
+    # Block if this IP already has an active clone
+    if client_ip in _active_clones:
+        raise HTTPException(status_code=429, detail="A clone is already in progress. Please wait for it to finish.")
+
+    # Rate limit per IP
     now = time.time()
     last_request = _rate_limit_map.get(client_ip, 0)
     if now - last_request < RATE_LIMIT_SECONDS:
         raise HTTPException(status_code=429, detail="Please wait before starting another clone")
     _rate_limit_map[client_ip] = now
 
-    # Check concurrency
+    # Check global concurrency
     if _clone_semaphore._value == 0:
         logger.warning(f"[clone] Rejected request from {client_ip}: all {MAX_CONCURRENT_CLONES} slots busy")
         raise HTTPException(status_code=503, detail=f"Server busy — {MAX_CONCURRENT_CLONES} clones already in progress. Try again shortly.")
 
+    clone_id = str(uuid.uuid4())
     status_queue: asyncio.Queue = asyncio.Queue()
 
-    async def on_status(message):
-        await status_queue.put(message)
+    _active_clones[client_ip] = clone_id
+    _clone_queues[clone_id] = status_queue
+
+    # Launch clone as a background task — survives SSE disconnect
+    asyncio.create_task(_run_clone(clone_id, url, status_queue, client_ip))
 
     async def event_stream():
-        clone_id = str(uuid.uuid4())
-        logger.info(f"[clone:{clone_id}] Starting clone for {url} (slots={_clone_semaphore._value}/{MAX_CONCURRENT_CLONES})")
-
-        await _clone_semaphore.acquire()
+        """SSE reader — forwards events from the background task to the client."""
         try:
-            # Step 1: Scrape the website
-            sandbox_clone_id = clone_id  # preserve original for sandbox cleanup
-            yield sse_event({"status": "scraping", "message": "Scraping website...", "clone_id": clone_id})
-            t0 = time.time()
-            try:
-                scrape_result = await scrape_and_capture(url)
-                screenshots = scrape_result["screenshots"]
-                html_source = scrape_result["html"]
-                image_urls = scrape_result["image_urls"]
-                scraped_styles = scrape_result.get("styles")
-                font_links = scrape_result.get("font_links", [])
-                scraped_icons = scrape_result.get("icons")
-                scraped_svgs = scrape_result.get("svgs", [])
-                scraped_logos = scrape_result.get("logos", [])
-                scraped_interactives = scrape_result.get("interactives", [])
-                scraped_linked_pages = scrape_result.get("linked_pages", [])
-                scroll_positions = scrape_result.get("scroll_positions", [])
-                scraped_region_types = scrape_result.get("region_types")
-                page_total_height = scrape_result.get("total_height", 0)
-            except Exception as e:
-                logger.error(f"[clone:{clone_id}] Scraping failed for {url}: {e}")
-                yield sse_event({"status": "error", "message": f"Failed to scrape website: {e}"})
-                return
-            t_scrape = time.time() - t0
-            logger.info(
-                f"[clone:{clone_id}] Scrape complete: {len(screenshots)} screenshots, "
-                f"{len(html_source)} chars HTML, {len(image_urls)} images ({t_scrape:.1f}s)"
-            )
-
-            section_info = f" (scroll positions: {scroll_positions})" if len(scroll_positions) > 1 else ""
-            yield sse_event({
-                "status": "screenshot",
-                "message": f"Captured {len(screenshots)} viewport screenshots ({t_scrape:.0f}s){section_info}",
-                "screenshot": screenshots[0] if screenshots else "",
-            })
-
-            # Step 2: AI generation + sandbox setup IN PARALLEL
-            gen_msg = "AI is generating the clone..."
-            yield sse_event({"status": "generating", "message": gen_msg})
-            t1 = time.time()
-
-            all_template_files = get_template_files()
-
-            async def _setup_sandbox():
-                try:
-                    return await setup_sandbox_shell(
-                        template_files=all_template_files,
-                        clone_id=clone_id,
-                        on_status=on_status,
-                    )
-                except Exception as e:
-                    logger.error(f"[clone:{clone_id}] Sandbox setup failed: {e}")
-                    return False
-
-            sandbox_task = asyncio.create_task(_setup_sandbox())
-
-            # Run AI generation as a background task so we can stream progress
-            ai_result_box: list = []
-            ai_error_box: list = []
-
-            async def _run_ai():
-                try:
-                    result = await generate_clone(
-                        html=html_source,
-                        screenshots=screenshots,
-                        image_urls=image_urls,
-                        url=url,
-                        styles=scraped_styles,
-                        font_links=font_links,
-                        icons=scraped_icons,
-                        svgs=scraped_svgs,
-                        logos=scraped_logos,
-                        interactives=scraped_interactives,
-                        linked_pages=scraped_linked_pages,
-                        scroll_positions=scroll_positions,
-                        total_height=page_total_height,
-                        region_types=scraped_region_types,
-                        on_status=on_status,
-                    )
-                    ai_result_box.append(result)
-                except Exception as e:
-                    ai_error_box.append(e)
-                await status_queue.put({"_done": True})
-
-            ai_task = asyncio.create_task(_run_ai())
-
-            # Stream progress events in real-time while AI generates
             while True:
                 try:
                     event = await asyncio.wait_for(status_queue.get(), timeout=300.0)
                 except asyncio.TimeoutError:
-                    if ai_task.done():
-                        break
-                    continue
+                    yield sse_event({"status": "error", "message": "Timed out waiting for clone"})
+                    break
 
                 if isinstance(event, dict) and event.get("_done"):
                     break
 
-                # Forward event to SSE stream
+                # Format and forward events
                 if isinstance(event, str):
                     yield sse_event({"status": "generating", "message": event})
                 elif isinstance(event, dict):
@@ -297,218 +490,10 @@ async def clone_website(request: CloneRequest, raw_request: Request):
                         })
                     else:
                         yield sse_event(event)
-
-            # Drain any remaining queue events
-            while not status_queue.empty():
-                try:
-                    event = status_queue.get_nowait()
-                    if isinstance(event, dict) and event.get("_done"):
-                        continue
-                    if isinstance(event, str):
-                        yield sse_event({"status": "generating", "message": event})
-                    elif isinstance(event, dict):
-                        evt_type = event.get("type", "")
-                        if evt_type == "file_write":
-                            yield sse_event({"status": "file_write", "type": "file_write", "file": event.get("file", ""), "action": event.get("action", "create"), "lines": event.get("lines", 0)})
-                        elif evt_type != "section_complete":
-                            yield sse_event(event)
-                except asyncio.QueueEmpty:
-                    break
-
-            if ai_error_box:
-                logger.error(f"[clone:{clone_id}] AI generation failed: {ai_error_box[0]}")
-                sandbox_task.cancel()
-                yield sse_event({"status": "error", "message": str(ai_error_box[0])})
-                return
-
-            ai_result = ai_result_box[0] if ai_result_box else {"files": [], "deps": []}
-            files = ai_result["files"]
-            ai_usage = ai_result.get("usage", {})
-            t_ai = time.time() - t1
-            logger.info(f"[clone:{clone_id}] AI generation complete: {len(files)} files ({t_ai:.1f}s)")
-
-            if not files:
-                sandbox_task.cancel()
-                yield sse_event({"status": "error", "message": "AI returned no files"})
-                return
-
-            # Wait for sandbox to be ready
-            yield sse_event({"status": "deploying", "message": "Waiting for sandbox..."})
-            t2 = time.time()
-            sandbox_ready = await sandbox_task
-            t_sandbox_wait = time.time() - t2
-            logger.info(f"[clone:{clone_id}] Sandbox ready={sandbox_ready} (waited {t_sandbox_wait:.1f}s)")
-
-            preview_url = None
-
-            if sandbox_ready:
-                # Upload generated files to sandbox
-                yield sse_event({"status": "deploying", "message": "Uploading generated code to sandbox..."})
-
-                for f in files:
-                    success = upload_file_to_sandbox(clone_id, f["path"], f["content"])
-                    if success:
-                        yield sse_event({
-                            "status": "file_upload",
-                            "message": f"Uploaded {f['path']}",
-                            "file": f["path"],
-                        })
-                    await asyncio.sleep(0.05)
-
-                # Start dev server and get live preview URL
-                yield sse_event({"status": "deploying", "message": "Starting live preview..."})
-                dev_url = await start_dev_server(
-                    clone_id=clone_id,
-                    on_status=on_status,
-                )
-
-                if dev_url:
-                    _sandbox_urls[clone_id] = (dev_url, time.time())
-                    preview_url = f"/api/sandbox/{clone_id}/"
-                    logger.info(f"[clone:{clone_id}] Live preview proxied at {preview_url} → {dev_url}")
-
-                    # Auto-fix loop: check for runtime errors, fix with AI, hot reload
-                    MAX_FIX_RETRIES = 3
-                    files_map = {f["path"]: f for f in files}
-
-                    for fix_attempt in range(MAX_FIX_RETRIES):
-                        await asyncio.sleep(2)  # let Next.js compile
-                        error_info = await _check_page_error(dev_url, clone_id)
-                        if not error_info:
-                            break  # page is healthy
-
-                        err_file = error_info.get("file", "")
-                        err_msg = error_info.get("message", "Unknown error")
-                        logger.warning(
-                            f"[clone:{clone_id}] Fix attempt {fix_attempt + 1}/{MAX_FIX_RETRIES}: "
-                            f"{err_msg} in {err_file}"
-                        )
-                        yield sse_event({
-                            "status": "fixing",
-                            "message": f"Fixing error in {err_file} (attempt {fix_attempt + 1}/{MAX_FIX_RETRIES})...",
-                        })
-
-                        # Find the broken file in our generated files
-                        broken_file = files_map.get(err_file)
-                        if not broken_file:
-                            # Try matching by component name
-                            for path, f in files_map.items():
-                                if err_file.split("/")[-1] in path:
-                                    broken_file = f
-                                    err_file = path
-                                    break
-                        if not broken_file:
-                            logger.warning(f"[clone:{clone_id}] Could not find {err_file} in generated files, skipping fix")
-                            break
-
-                        # Ask AI to fix the component
-                        try:
-                            fix_result = await fix_component(
-                                file_path=err_file,
-                                file_content=broken_file["content"],
-                                error_message=err_msg,
-                            )
-                            fixed_content = fix_result["content"]
-                            fix_usage = fix_result["usage"]
-
-                            # Track fix cost in overall usage
-                            ai_usage["tokens_in"] = ai_usage.get("tokens_in", 0) + fix_usage["tokens_in"]
-                            ai_usage["tokens_out"] = ai_usage.get("tokens_out", 0) + fix_usage["tokens_out"]
-                            ai_usage["api_calls"] = ai_usage.get("api_calls", 0) + 1
-
-                            # Update file in our list and upload to sandbox (hot reload)
-                            broken_file["content"] = fixed_content
-                            upload_file_to_sandbox(clone_id, err_file, fixed_content)
-                            logger.info(f"[clone:{clone_id}] Uploaded fix for {err_file}, waiting for hot reload...")
-
-                            yield sse_event({
-                                "status": "file_write",
-                                "type": "file_write",
-                                "file": err_file,
-                                "action": "fix",
-                                "lines": fixed_content.count("\n") + 1,
-                            })
-                        except Exception as e:
-                            logger.error(f"[clone:{clone_id}] Fix attempt failed: {e}")
-                            break
-                    else:
-                        logger.warning(f"[clone:{clone_id}] Exhausted {MAX_FIX_RETRIES} fix attempts")
-
-                    # Recalculate total cost after fixes
-                    if ai_usage:
-                        from app.services.ai_generator import _calc_cost
-                        ai_usage["total_cost"] = _calc_cost(
-                            ai_usage.get("tokens_in", 0),
-                            ai_usage.get("tokens_out", 0),
-                            ai_usage.get("model", "anthropic/claude-sonnet-4.5"),
-                        )
-
-                    # Persist source files to storage for sandbox re-creation later
-                    source_files = {f["path"]: f["content"].encode("utf-8") for f in files}
-                    upload_static_files(clone_id, source_files)
-                else:
-                    logger.warning(f"[clone:{clone_id}] Dev server failed to start")
-                    yield sse_event({"status": "error", "message": "Preview failed to start"})
-                    return
-            else:
-                logger.warning(f"[clone:{clone_id}] No sandbox available")
-                yield sse_event({"status": "error", "message": "Sandbox unavailable"})
-                return
-
-            t_total = time.time() - t0
-            total_lines = sum(f["content"].count("\n") + 1 for f in files)
-            cost_str = f", cost=${ai_usage.get('total_cost', 0):.4f}" if ai_usage else ""
-            logger.info(
-                f"[clone:{clone_id}] DONE: {t_total:.1f}s total "
-                f"(scrape={t_scrape:.1f}s, ai={t_ai:.1f}s, sandbox_wait={t_sandbox_wait:.1f}s) "
-                f"| {len(files)} files, {total_lines} lines{cost_str}"
-            )
-
-            # Only save to DB if we have a working preview
-            db_record = await save_clone(
-                url=url,
-                preview_url=preview_url,
-            )
-
-            if db_record and "id" in db_record:
-                clone_id = db_record["id"]
-                logger.info(f"[clone:{clone_id}] Saved to database")
-
-            # Build file list for the frontend code viewer
-            file_list = [
-                {
-                    "path": f["path"],
-                    "content": f["content"],
-                    "lines": f["content"].count("\n") + 1,
-                }
-                for f in files
-            ]
-
-            scaffold_paths = sorted(set(tf["path"] for tf in all_template_files))
-
-            yield sse_event({
-                "status": "done",
-                "message": "Clone complete!",
-                "preview_url": preview_url,
-                "clone_id": clone_id,
-                "files": file_list,
-                "scaffold_paths": scaffold_paths,
-                "usage": ai_usage,
-            })
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception(f"[clone:{clone_id}] Unhandled error for {url}")
-            yield sse_event({"status": "error", "message": str(e)})
+        except Exception:
+            pass  # Client disconnected — background task continues
         finally:
-            _clone_semaphore.release()
-            logger.info(f"[clone:{clone_id}] Released slot (slots={_clone_semaphore._value}/{MAX_CONCURRENT_CLONES})")
-            # On SSE disconnect (client closed tab mid-stream), clean up the sandbox
-            if sandbox_clone_id not in _sandbox_urls:
-                # Sandbox was never fully set up or already removed — clean up instance
-                await cleanup_sandbox(sandbox_clone_id)
-                logger.info(f"[clone:{sandbox_clone_id}] Cleaned up sandbox on stream end")
+            _clone_queues.pop(clone_id, None)
 
         yield "data: [DONE]\n\n"
 
@@ -756,3 +741,12 @@ async def get_clone_detail(clone_id: str):
 
     record["preview_url"] = record.get("preview_url") or f"/api/preview/{clone_id}"
     return record
+
+
+@router.get("/api/clones/{clone_id}/files")
+async def get_clone_files(clone_id: str):
+    """Get all generated source files for a clone from Supabase Storage."""
+    files = list_storage_files(clone_id)
+    if not files:
+        raise HTTPException(status_code=404, detail="No files found for this clone")
+    return {"files": files}
