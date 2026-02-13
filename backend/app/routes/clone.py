@@ -881,11 +881,311 @@ async def preview_clone(clone_id: str):
         return RedirectResponse(url=f"/api/sandbox/{clone_id}/")
 
     record = await get_clone(clone_id)
-    if record and record.get("preview_url", "").startswith("/api/"):
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(url=record["preview_url"])
+    if record:
+        preview_url = record.get("preview_url", "")
+        # Only redirect to sandbox if it's actually alive
+        if preview_url.startswith("/api/sandbox/"):
+            pass  # Dead sandbox — fall through to React rendering
+        elif preview_url.startswith("/api/"):
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=preview_url)
+
+    # Fallback: render React components client-side from stored source files
+    source_files = list_storage_files(clone_id)
+    if source_files:
+        html = _build_react_preview_html(source_files)
+        if html:
+            return HTMLResponse(content=html)
 
     raise HTTPException(status_code=404, detail="Clone not found")
+
+
+def _build_react_preview_html(source_files: list[dict]) -> str | None:
+    """Build an HTML page that renders React TSX components client-side.
+
+    Uses React + ReactDOM + Babel standalone from CDN to compile and render
+    the actual TSX source in the browser. No regex HTML conversion needed.
+    """
+    if not source_files:
+        return None
+
+    files_by_path = {f["path"]: f["content"] for f in source_files}
+    page_src = files_by_path.get("app/page.tsx", "")
+    if not page_src:
+        return None
+
+    # Extract Google Fonts URLs from all source files
+    font_links = set()
+    for f in source_files:
+        for m in _re.finditer(r'(https://fonts\.googleapis\.com/css2?\?[^"\')\s]+)', f["content"]):
+            font_links.add(m.group(1))
+        for m in _re.finditer(r'href\s*=\s*["\']?(https://fonts\.googleapis\.com/css[^"\')\s]+)', f["content"]):
+            font_links.add(m.group(1))
+    font_tags = "\n".join(f'<link rel="stylesheet" href="{url}">' for url in font_links)
+
+    # Detect which third-party packages are used
+    all_content = "\n".join(f["content"] for f in source_files)
+    needs_lucide = bool(_re.search(r'from\s+["\']lucide-react["\']', all_content))
+    needs_framer = bool(_re.search(r'from\s+["\']framer-motion["\']', all_content))
+
+    # Process each source file into browser-ready JSX
+    component_scripts = []
+    page_script = None
+
+    # Collect component names for the page to reference
+    component_names = []
+    for f in source_files:
+        path = f["path"]
+        if path.startswith("components/") and path.endswith(".tsx"):
+            name = path.replace("components/", "").replace(".tsx", "")
+            component_names.append(name)
+
+    for f in source_files:
+        path = f["path"]
+        content = f["content"]
+
+        # Only process TSX/JSX files
+        if not (path.endswith(".tsx") or path.endswith(".jsx")):
+            continue
+        # Skip CSS files
+        if path.endswith(".css"):
+            continue
+
+        is_page = (path == "app/page.tsx")
+        processed = _process_tsx_for_browser(content, rename_to="Page" if is_page else None)
+        if not processed:
+            continue
+
+        if is_page:
+            page_script = processed
+        elif path.startswith("components/"):
+            component_scripts.append(processed)
+
+    if not page_script:
+        return None
+
+    # Extract globals.css if present
+    globals_css = files_by_path.get("app/globals.css", "")
+    # Strip @tailwind directives (Tailwind CDN handles this) and @import statements
+    globals_css = _re.sub(r'@tailwind\s+\w+\s*;', '', globals_css)
+    globals_css = _re.sub(r'@import\s+[^;]+;', '', globals_css)
+
+    # Build lucide-react stub: creates components for each icon used
+    lucide_stub = ""
+    if needs_lucide:
+        # Find all icon imports: import { Menu, X, Search } from "lucide-react"
+        icon_names = set()
+        for m in _re.finditer(r'import\s*\{([^}]+)\}\s*from\s*["\']lucide-react["\']', all_content):
+            for name in m.group(1).split(","):
+                name = name.strip()
+                if name and name[0].isupper():
+                    icon_names.add(name)
+        if icon_names:
+            icon_components = []
+            for name in sorted(icon_names):
+                icon_components.append(
+                    f'  function {name}(props) {{ return React.createElement("svg", '
+                    f'Object.assign({{ width: props.size || 24, height: props.size || 24, '
+                    f'viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", '
+                    f'strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }}, props)); }}'
+                )
+            lucide_stub = "\n".join(icon_components)
+
+    # Build framer-motion stub
+    framer_stub = ""
+    if needs_framer:
+        framer_stub = """
+  const motion = new Proxy({}, {
+    get: (_, tag) => React.forwardRef((props, ref) => {
+      const filtered = Object.fromEntries(
+        Object.entries(props).filter(([k]) =>
+          !['initial','animate','exit','transition','whileHover','whileInView',
+           'whileTap','whileFocus','whileDrag','variants','viewport','layout',
+           'layoutId','drag','dragConstraints','dragElastic'].includes(k)
+        )
+      );
+      return React.createElement(tag, { ...filtered, ref });
+    })
+  });
+  const AnimatePresence = ({ children }) => children;
+  const useAnimation = () => ({ start: () => {} });
+  const useInView = () => [null, true];
+  const useScroll = () => ({ scrollYProgress: { get: () => 0 } });
+  const useTransform = () => 0;
+  const useMotionValue = (v) => ({ get: () => v, set: () => {} });
+"""
+
+    # Combine all scripts
+    all_scripts = "\n\n".join(component_scripts)
+    if page_script:
+        all_scripts += "\n\n" + page_script
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+{font_tags}
+<style>
+{globals_css}
+body {{ margin: 0; padding: 0; }}
+img {{ max-width: 100%; height: auto; }}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+Babel.registerPreset("tsx", {{
+  presets: [
+    [Babel.availablePresets["typescript"], {{ isTSX: true, allExtensions: true }}],
+    [Babel.availablePresets["react"]]
+  ]
+}});
+</script>
+<script type="text/babel" data-presets="tsx">
+{{
+  // React hooks as locals
+  const {{ useState, useEffect, useRef, useMemo, useCallback, useContext, createContext, Fragment, forwardRef }} = React;
+
+  // Next.js stubs
+  function Image(props) {{
+    const {{ src, alt, width, height, fill, priority, quality, placeholder, blurDataURL, loader, ...rest }} = props;
+    const style = fill ? {{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: rest.objectFit || 'cover', ...rest.style }} : rest.style;
+    return React.createElement("img", {{ src, alt, width: fill ? undefined : width, height: fill ? undefined : height, style, ...rest }});
+  }}
+  function Link(props) {{
+    const {{ href, children, ...rest }} = props;
+    return React.createElement("a", {{ href, ...rest }}, children);
+  }}
+  function useRouter() {{ return {{ push: () => {{}}, back: () => {{}}, pathname: "/" }}; }}
+  function usePathname() {{ return "/"; }}
+  function useSearchParams() {{ return new URLSearchParams(); }}
+
+  // Third-party stubs
+{lucide_stub}
+{framer_stub}
+
+  // ── Components ──
+{all_scripts}
+
+  // ── Render ──
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  root.render(React.createElement(Page, null));
+}}
+</script>
+</body>
+</html>"""
+
+
+def _process_tsx_for_browser(source: str, rename_to: str | None = None) -> str | None:
+    """Process a TSX source file for browser execution via Babel standalone.
+
+    Strips imports/exports and converts to a plain function declaration.
+    If rename_to is provided, renames the default export to that name.
+    """
+    lines = source.split("\n")
+    output_lines = []
+    component_name = None
+    i = 0
+    in_multiline_import = False
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Skip "use client" directives
+        if stripped in ('"use client"', "'use client'", '"use client";', "'use client';"):
+            i += 1
+            continue
+
+        # Handle multi-line imports: skip until we see the closing line with 'from'
+        if in_multiline_import:
+            if _re.search(r'from\s+["\']', stripped) or stripped.endswith(';'):
+                in_multiline_import = False
+            i += 1
+            continue
+
+        # Skip import statements
+        if _re.match(r'^import\s+', stripped):
+            # Check if it's a multi-line import (has { but no closing })
+            if '{' in stripped and '}' not in stripped:
+                in_multiline_import = True
+            i += 1
+            continue
+
+        # Convert export default function → function
+        m = _re.match(r'^export\s+default\s+function\s+(\w+)', stripped)
+        if m:
+            component_name = m.group(1)
+            new_name = rename_to or component_name
+            output_lines.append(_re.sub(
+                r'export\s+default\s+function\s+\w+',
+                f'function {new_name}',
+                line
+            ))
+            i += 1
+            continue
+
+        # Convert export function → function
+        m = _re.match(r'^export\s+function\s+(\w+)', stripped)
+        if m:
+            if not component_name:
+                component_name = m.group(1)
+            output_lines.append(line.replace("export function", "function"))
+            i += 1
+            continue
+
+        # Skip standalone export default
+        if _re.match(r'^export\s+default\s+\w+\s*;?\s*$', stripped):
+            i += 1
+            continue
+
+        # Skip TypeScript interface/type blocks
+        if _re.match(r'^(export\s+)?(interface|type)\s+\w+', stripped):
+            if '{' in stripped and '}' not in stripped:
+                # Multi-line interface/type — skip until closing }
+                depth = stripped.count('{') - stripped.count('}')
+                i += 1
+                while i < len(lines) and depth > 0:
+                    depth += lines[i].count('{') - lines[i].count('}')
+                    i += 1
+                continue
+            else:
+                # Single-line type/interface
+                i += 1
+                continue
+
+        # Skip 'export const' that are type-only (e.g. export const metadata = ...)
+        if _re.match(r'^export\s+const\s+metadata\s*', stripped):
+            # Skip metadata exports (Next.js specific)
+            if '{' in stripped and '}' not in stripped:
+                depth = stripped.count('{') - stripped.count('}')
+                i += 1
+                while i < len(lines) and depth > 0:
+                    depth += lines[i].count('{') - lines[i].count('}')
+                    i += 1
+                continue
+            i += 1
+            continue
+
+        # Convert other export const → const
+        if _re.match(r'^export\s+(const|let|var)\s+', stripped):
+            output_lines.append(line.replace("export const", "const").replace("export let", "let").replace("export var", "var"))
+            i += 1
+            continue
+
+        output_lines.append(line)
+        i += 1
+
+    result = "\n".join(output_lines).strip()
+    if not result:
+        return None
+
+    return result
 
 
 @router.get("/api/clones")
